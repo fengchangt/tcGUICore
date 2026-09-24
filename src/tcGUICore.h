@@ -6,6 +6,7 @@
 #include "Common/Types.h"
 #include "AdsManager/AdsHub.h"
 #include "Viewer/UiBind.h"
+#include "Viewer/DashWidgets.h"
 
 #include <functional>
 #include <string>

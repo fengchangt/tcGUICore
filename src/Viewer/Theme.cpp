@@ -101,6 +101,8 @@ void loadDefaultFonts()
         {"/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0},
         {"/usr/share/fonts/truetype/arphic/uming.ttc", 0},
         {"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0},
+        {"/usr/share/fonts/truetype/freefont/FreeSans.ttf", 0},
+        {"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 0},
     };
 
     ImFont* loaded = nullptr;

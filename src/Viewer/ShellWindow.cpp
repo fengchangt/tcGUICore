@@ -422,7 +422,9 @@ void drawCaptionGlyph(ImVec2 center, int kind)
     const float s = 5.5f;
     if (kind == 0) {
         dl->AddLine(ImVec2(center.x - s, center.y), ImVec2(center.x + s, center.y), col, 1.4f);
-    } else if (kind == 2) {
+        return;
+    }
+    if (kind == 2) {
         dl->AddLine(ImVec2(center.x - s, center.y - s), ImVec2(center.x + s, center.y + s), col, 1.4f);
         dl->AddLine(ImVec2(center.x + s, center.y - s), ImVec2(center.x - s, center.y + s), col, 1.4f);
         return;
@@ -1876,18 +1878,34 @@ int ShellWindow::run()
         return 1;
     }
 
+    const char* glslVersion = "#version 330";
 #ifdef _WIN32
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-#else
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE);
-#endif
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
-
     GLFWwindow* window = glfwCreateWindow(window_.width, window_.height, title_.c_str(), nullptr, nullptr);
+#else
+    // Ubuntu 虚拟机一般有 OpenGL 3.3。树莓派桌面多为 3.1，失败后再降一档。
+    GLFWwindow* window = nullptr;
+    const int glVersions[][3] = {
+        {3, 3, GLFW_OPENGL_CORE_PROFILE},
+        {3, 1, GLFW_OPENGL_ANY_PROFILE},
+    };
+    const char* glslForVersion[] = {"#version 330", "#version 140"};
+    for (int attempt = 0; attempt < 2 && !window; ++attempt) {
+        glfwDefaultWindowHints();
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, glVersions[attempt][0]);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, glVersions[attempt][1]);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, glVersions[attempt][2]);
+        glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE);
+        glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+        glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+        window = glfwCreateWindow(window_.width, window_.height, title_.c_str(), nullptr, nullptr);
+        if (window) {
+            glslVersion = glslForVersion[attempt];
+        }
+    }
+#endif
     if (!window) {
         glfwTerminate();
         return 1;
@@ -1988,7 +2006,7 @@ int ShellWindow::run()
     }
 #else
     ImGui_ImplGlfw_InitForOpenGL(window, true);
-    ImGui_ImplOpenGL3_Init("#version 330");
+    ImGui_ImplOpenGL3_Init(glslVersion);
 #endif
 
     logInfo(std::string(tr("启动界面: ", "UI start: ")) + title_);
