@@ -1,0 +1,25 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+if(@TCGUICORE_ENABLE_GUI@)
+    find_dependency(OpenGL)
+    if(NOT TARGET glfw AND NOT TARGET glfw::glfw)
+        find_dependency(glfw3)
+    endif()
+    if(NOT TARGET glfw AND TARGET glfw::glfw)
+        add_library(glfw ALIAS glfw::glfw)
+    endif()
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/tcGUICoreTargets.cmake")
+
+if(TARGET tcGUICore::AdsLib AND NOT TARGET tcGUICore::ads)
+    add_library(tcGUICore::ads ALIAS tcGUICore::AdsLib)
+endif()
+if(TARGET tcGUICore::NDI_CombinedApi AND NOT TARGET tcGUICore::ndi)
+    add_library(tcGUICore::ndi ALIAS tcGUICore::NDI_CombinedApi)
+endif()
+
+check_required_components(tcGUICore)

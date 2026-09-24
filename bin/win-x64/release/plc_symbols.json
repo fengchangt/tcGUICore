@@ -1,0 +1,38 @@
+{
+  "window": {
+    "width": 1920,
+    "height": 1080,
+    "language": "zh"
+  },
+  "plcs": [
+    {
+      "id": "plc1",
+      "ip": "127.0.0.1",
+      "adsPort": 851,
+      "timeoutMs": 2000,
+      "variables": [
+        {
+          "name": "bEnable",
+          "symbol": "MAIN.bEnable",
+          "type": "bool",
+          "direction": "output",
+          "label": { "zh": "使能", "en": "Enable" }
+        },
+        {
+          "name": "fPosition",
+          "symbol": "GVL.fPosition",
+          "type": "float",
+          "direction": "input",
+          "label": { "zh": "位置 mm", "en": "Position mm" }
+        },
+        {
+          "name": "nState",
+          "symbol": "GVL.nState",
+          "type": "int16",
+          "direction": "input",
+          "label": { "zh": "状态字", "en": "State word" }
+        }
+      ]
+    }
+  ]
+}

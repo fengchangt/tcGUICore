@@ -1,0 +1,55 @@
+{
+  "window": {
+    "width": 1920,
+    "height": 1080,
+    "language": "zh"
+  },
+  "plcs": [
+    {
+      "id": "plc_left",
+      "displayName": { "zh": "左工位", "en": "Left station" },
+      "ip": "192.168.1.10",
+      "amsNetId": "192.168.1.10.1.1",
+      "adsPort": 851,
+      "variables": [
+        {
+          "name": "bReady",
+          "symbol": "MAIN.bReady",
+          "type": "bool",
+          "direction": "input",
+          "label": { "zh": "左就绪", "en": "Left ready" }
+        },
+        {
+          "name": "bStart",
+          "symbol": "MAIN.bStart",
+          "type": "bool",
+          "direction": "output",
+          "label": { "zh": "左启动", "en": "Left start" }
+        }
+      ]
+    },
+    {
+      "id": "plc_right",
+      "displayName": { "zh": "右工位", "en": "Right station" },
+      "ip": "192.168.1.11",
+      "amsNetId": "192.168.1.11.1.1",
+      "adsPort": 851,
+      "variables": [
+        {
+          "name": "bReady",
+          "symbol": "MAIN.bReady",
+          "type": "bool",
+          "direction": "input",
+          "label": { "zh": "右就绪", "en": "Right ready" }
+        },
+        {
+          "name": "fSpeed",
+          "symbol": "GVL.fSpeed",
+          "type": "float",
+          "direction": "output",
+          "label": { "zh": "右速度", "en": "Right speed" }
+        }
+      ]
+    }
+  ]
+}

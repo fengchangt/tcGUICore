@@ -1,0 +1,7 @@
+
+PROJECT=cvGUICore
+DESCRIPTION=Curve Robotics GUI Core Framework
+MAJOR=0
+MINOR=0
+PATCH=0
+PRERELEASE=1
