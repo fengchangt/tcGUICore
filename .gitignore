@@ -1,5 +1,42 @@
-# 忽略 build 文件夹
+# C++ / CMake 编译产物（本仓库输出，不含 thirdparty 里自带的库）
 /build/
+/bin/
+/lib/
+/out/
+/cmake-build-*/
 
-# 忽略所有的*.log文件
+# MSVC / Ninja 中间文件
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.pch
+*.iobj
+*.ipdb
+*.tlog
+*.lastbuildstate
+*.recipe
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+
+# PLC / TwinCAT 编译与引导临时文件
+**/_Boot/
+**/_CompileInfo/
+*.tmc
+*.tpy
+*.tclrs
+*.bak
+*.ori
+*.compileinfo
+
+# 日志
 *.log

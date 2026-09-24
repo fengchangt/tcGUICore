@@ -5,7 +5,7 @@
 #include <vector>
 
 // NDI Combined API 会话。串口命令只在工作线程里调用。
-// 四个通道的位姿先留在这里，等 PLC 数据协议确定后再经 ADS 写出。
+// 四个通道的位姿由界面按 S_EMSensorPose 写入 EMSensor.stAdsInput.sEMSensorPose。
 
 enum class NdiLinkState {
     Idle = 0,
@@ -40,6 +40,9 @@ public:
 
     static std::vector<std::string> listComPorts();
 
+    // NDI 端口号 → PLC 下标。通道 2、3 写入 sEMSensorPose[2]、[3]，空通道不前移。
+    static int channelNumber(unsigned handle);
+
     // baudIndex 与界面下拉一致：0=9600 ... 6=921600 ... 7=1228739。
     void requestConnect(std::string comPort, int baudIndex);
     void requestDisconnect();
@@ -47,6 +50,7 @@ public:
     NdiLinkState state() const;
     std::string message() const;
     std::array<NdiChannelPose, kChannels> poses() const;
+    double sampleHz() const;
 
 private:
     struct Worker;

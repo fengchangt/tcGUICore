@@ -2,64 +2,39 @@
 
 #include "NdiSession.h"
 
-#include "AdsManager/AdsHub.h"
-#include "AdsManager/AdsScan.h"
 #include "AdsManager/PlcClient.h"
 #include "Common/I18n.h"
+#include "Common/Log.h"
 #include "tcGUICore.h"
 
 #include "imgui.h"
 
 #include <atomic>
-#include <cstdlib>
-#include <cstdio>
-#include <cstring>
-#include <mutex>
+#include <chrono>
+#include <cstdint>
 #include <string>
 #include <thread>
-#include <vector>
 
 namespace {
-
-constexpr const char* kPlcId = "plc1";
 
 const char* kBaudLabels[] = {
     "9600", "14400", "19200", "38400", "57600", "115200", "921600", "1228739"
 };
-const char* kAdsPorts[] = {"851", "852", "853", "801", "10000"};
 
-struct PlcScan {
-    ~PlcScan()
-    {
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
-
-    std::mutex mu;
-    std::thread worker;
-    std::vector<tcGUICore::AdsEndpoint> found;
-    std::atomic<bool> scanning{false};
-
-    void start()
-    {
-        if (scanning.load()) {
-            return;
-        }
-        if (worker.joinable()) {
-            worker.join();
-        }
-        scanning = true;
-        worker = std::thread([this] {
-            std::vector<tcGUICore::AdsEndpoint> endpoints = tcGUICore::scanAdsIpsOnce(700);
-            {
-                std::lock_guard<std::mutex> lock(mu);
-                found = std::move(endpoints);
-            }
-            scanning = false;
-        });
-    }
+// pack_mode := 1：按 1 字节对齐，LREAL 之间无填充。
+// S_EMSensorPose = 4*8 + 3*8 = 56。ARRAY[1..4] 共 224，[1] 在偏移 0，[2] 在 56。
+#pragma pack(push, 1)
+struct EmSensorPosePlc {
+    double lQuaternion[4];
+    double lPos[3];
 };
+#pragma pack(pop)
+static_assert(sizeof(EmSensorPosePlc) == 56, "S_EMSensorPose pack_mode 1");
+static_assert(sizeof(EmSensorPosePlc) * NdiSession::kChannels == 224, "sEMSensorPose[1..4]");
+
+constexpr char kPoseSymbol[] = "EMSensor.stAdsInput.sEMSensorPose";
+constexpr char kBeatSymbol[] = "EMSensor.stAdsInput.bHeatBeat";
+double gPoseWriteHz = 0;
 
 void drawLed(bool on)
 {
@@ -155,103 +130,93 @@ void drawNdiRow(NdiSession& session)
     ImGui::TextUnformatted(session.message().c_str());
 }
 
-void drawPlcRow()
+void publishLoop(NdiSession* session, const std::atomic<bool>* stop)
 {
-    static char ip[64] = "172.13.158.17";
-    static int portIndex = 0;
-    static std::string scannedIp;
-    static std::string scannedNetId;
-    static PlcScan scan;
-
-    tcGUICore::PlcClient* plc = plcClient();
-    const bool linked = plc && plc->state() == tcGUICore::ConnectionState::Connected;
-    const bool connecting = plc && plc->state() == tcGUICore::ConnectionState::Connecting;
-
-    ImGui::SeparatorText("PLC");
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted("IP:");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(180.0f);
-    ImGui::InputText("##plc_ip", ip, sizeof(ip));
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(150.0f);
-    const char* scanPreview = scan.scanning.load()
-        ? tcGUICore::tr("扫描中", "Scanning")
-        : tcGUICore::tr("扫描地址", "Scanned");
-    if (ImGui::BeginCombo("##plc_scan", scanPreview)) {
-        if (ImGui::IsWindowAppearing()) {
-            scan.start();
+    int writeCount = 0;
+    auto writeWindow = std::chrono::steady_clock::time_point{};
+    auto lastBeat = std::chrono::steady_clock::time_point{};
+    uint8_t beat = 0;
+    bool poseWarned = false;
+    while (!stop->load(std::memory_order_relaxed)) {
+        tcGUICore::PlcClient* plc = plcClient();
+        if (!session || !plc || plc->state() != tcGUICore::ConnectionState::Connected) {
+            gPoseWriteHz = 0;
+            writeCount = 0;
+            writeWindow = {};
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
         }
-        std::vector<tcGUICore::AdsEndpoint> found;
-        {
-            std::lock_guard<std::mutex> lock(scan.mu);
-            found = scan.found;
-        }
-        if (found.empty()) {
-            ImGui::TextUnformatted(scan.scanning.load()
-                ? tcGUICore::tr("正在扫描", "Scanning")
-                : tcGUICore::tr("无结果", "No PLC"));
-        }
-        for (const tcGUICore::AdsEndpoint& endpoint : found) {
-            if (ImGui::Selectable(endpoint.ip.c_str(), endpoint.ip == ip)) {
-                std::snprintf(ip, sizeof(ip), "%s", endpoint.ip.c_str());
-                scannedIp = endpoint.ip;
-                scannedNetId = endpoint.amsNetId;
+        const auto poses = session->poses();
+        EmSensorPosePlc blob[NdiSession::kChannels]{};
+        for (int i = 0; i < NdiSession::kChannels; ++i) {
+            const NdiChannelPose& pose = poses[static_cast<std::size_t>(i)];
+            if (!pose.valid) {
+                continue;
             }
+            blob[i].lQuaternion[0] = pose.q0;
+            blob[i].lQuaternion[1] = pose.qx;
+            blob[i].lQuaternion[2] = pose.qy;
+            blob[i].lQuaternion[3] = pose.qz;
+            blob[i].lPos[0] = pose.tx;
+            blob[i].lPos[1] = pose.ty;
+            blob[i].lPos[2] = pose.tz;
         }
-        ImGui::EndCombo();
-    }
-
-    ImGui::SameLine();
-    ImGui::TextUnformatted(tcGUICore::tr("端口:", "Port:"));
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(110.0f);
-    ImGui::Combo("##plc_port", &portIndex, kAdsPorts, IM_ARRAYSIZE(kAdsPorts));
-
-    ImGui::SameLine();
-    drawLed(linked);
-    ImGui::SameLine();
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
-    const char* label = linked ? tcGUICore::tr("断开", "Disconnect") : tcGUICore::tr("连接", "Connect");
-    if (ImGui::Button(label, ImVec2(108.0f, 0.0f)) && plc && !connecting) {
-        if (linked) {
-            plc->disconnect();
-        } else if (ip[0] != '\0') {
-            const int slot = portIndex >= 0 && portIndex < IM_ARRAYSIZE(kAdsPorts) ? portIndex : 0;
-            const auto adsPort = static_cast<uint16_t>(std::atoi(kAdsPorts[slot]));
-            const std::string address = ip;
-            const std::string netId = (address == scannedIp && !scannedNetId.empty())
-                ? scannedNetId
-                : tcGUICore::amsNetIdFromIp(address);
-            tcGUICore::Application::instance()->ads().applyConnectionSettings(kPlcId, address, adsPort, netId);
-            plc->connectAsync();
+        const auto now = std::chrono::steady_clock::now();
+        if (plc->writeSymbol(kPoseSymbol, blob, sizeof(blob))) {
+            poseWarned = false;
+            if (writeWindow.time_since_epoch().count() == 0) {
+                writeWindow = now;
+            }
+            ++writeCount;
+            const auto elapsed = now - writeWindow;
+            if (elapsed >= std::chrono::milliseconds(500)) {
+                const double seconds = std::chrono::duration<double>(elapsed).count();
+                gPoseWriteHz = seconds > 0.0 ? static_cast<double>(writeCount) / seconds : 0.0;
+                writeCount = 0;
+                writeWindow = now;
+            }
+        } else if (!poseWarned) {
+            poseWarned = true;
+            tcGUICore::logWarn(std::string(tcGUICore::tr("写入位姿失败 ", "Pose write failed ")) + kPoseSymbol);
         }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button(tcGUICore::currentLanguage() == tcGUICore::Language::Zh ? "中文" : "EN", ImVec2(88.0f, 0.0f))) {
-        tcGUICore::toggleLanguage();
-    }
-    ImGui::PopStyleVar();
-
-    if (plc) {
-        const std::string error = plc->lastError();
-        const std::string device = plc->deviceName();
-        if (!error.empty() && !linked) {
-            ImGui::SameLine();
-            ImGui::TextUnformatted(error.c_str());
-        } else if (linked && !device.empty()) {
-            ImGui::SameLine();
-            ImGui::TextUnformatted(device.c_str());
+        if (lastBeat.time_since_epoch().count() == 0 || now - lastBeat >= std::chrono::milliseconds(200)) {
+            lastBeat = now;
+            beat ^= 1;
+            plc->writeSymbol(kBeatSymbol, &beat, 1);
         }
     }
+}
+
+struct PosePublisher {
+    std::atomic<bool> stop{false};
+    std::thread thread;
+
+    explicit PosePublisher(NdiSession* session)
+    {
+        thread = std::thread(publishLoop, session, &stop);
+    }
+
+    ~PosePublisher()
+    {
+        stop.store(true, std::memory_order_relaxed);
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+};
+
+double poseWriteHz()
+{
+    return gPoseWriteHz;
 }
 
 void drawPoseTable(const NdiSession& session)
 {
     ImGui::SeparatorText(tcGUICore::tr("四通道位姿", "Four channels"));
     ImGui::TextUnformatted(tcGUICore::tr(
-        "四元数 q0 qx qy qz，位置 X Y Z，单位 mm。ADS 透传等数据协议对齐后再写入 PLC。",
-        "Quaternion q0 qx qy qz and position X Y Z in mm. ADS write waits for the PLC protocol."));
+        "四元数 q0 qx qy qz，位置 X Y Z，单位 mm。通道号即 sEMSensorPose 下标，空通道写 0。",
+        "Quaternion q0 qx qy qz and position X Y Z in mm. Channel number is the sEMSensorPose index; empty channels are written as 0."));
+    ImGui::Text("NDI %.1f Hz    ADS %.1f Hz", session.sampleHz(), poseWriteHz());
 
     const auto poses = session.poses();
     const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp;
@@ -303,6 +268,9 @@ void drawNdiEmSensorUi()
 {
     static NdiSession session;
 
+    tcGUICore::drawPlcConnectionBar();
+    ImGui::Separator();
+
     const float footer = ImGui::GetFrameHeightWithSpacing();
     ImVec2 body = ImGui::GetContentRegionAvail();
     body.y -= footer;
@@ -311,7 +279,7 @@ void drawNdiEmSensorUi()
     }
     ImGui::BeginChild("##ndi_body", body, ImGuiChildFlags_None);
     drawNdiRow(session);
-    drawPlcRow();
     drawPoseTable(session);
+    static PosePublisher publisher(&session);
     ImGui::EndChild();
 }

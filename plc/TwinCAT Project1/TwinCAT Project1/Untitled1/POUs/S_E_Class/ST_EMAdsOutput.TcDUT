@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.15">
+  <DUT Name="ST_EMAdsOutput" Id="{0737d3e3-121c-48d0-a13f-e99f3d4074e8}">
+    <Declaration><![CDATA[{attribute 'pack_mode' := '1'}
+TYPE ST_EMAdsOutput :
+STRUCT
+	lDataScope						: ARRAY[0..11] OF LREAL;// 示波器变量
+	bHeatBeat						: BOOL;// 心跳
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1710,24 +1710,8 @@ void drawFrameFooter(const ImGuiViewport* vp)
     ImGui::PopStyleVar();
 }
 
-void drawExplorerFrame()
+void drawPlcConnectionBarImpl()
 {
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(vp->WorkPos);
-    ImGui::SetNextWindowSize(vp->WorkSize);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::Begin("##explorer", nullptr,
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings);
-    pollWindowResize();
-    drawTitleBar();
-    if (gProductFrame) {
-        gProductFrame();
-        drawFrameFooter(vp);
-        return;
-    }
-
     static int ipIndex = 0;
     static int portIndex = 0;
     static std::vector<std::string> ips = {"172.13.158.17", "172.13.158.13"};
@@ -1802,6 +1786,27 @@ void drawExplorerFrame()
         toggleLanguage();
     }
     ImGui::PopStyleVar();
+}
+
+void drawExplorerFrame()
+{
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::Begin("##explorer", nullptr,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings);
+    pollWindowResize();
+    drawTitleBar();
+    if (gProductFrame) {
+        gProductFrame();
+        drawFrameFooter(vp);
+        return;
+    }
+
+    drawPlcConnectionBarImpl();
     ImGui::Separator();
 
     ImVec2 body = ImGui::GetContentRegionAvail();
@@ -1845,6 +1850,11 @@ void drawExplorerFrame()
 }
 
 } // namespace
+
+void drawPlcConnectionBar()
+{
+    drawPlcConnectionBarImpl();
+}
 
 ShellWindow::ShellWindow(std::string title, AdsHub& hub, FrameCallback onFrame, WindowConfig window)
     : title_(std::move(title))

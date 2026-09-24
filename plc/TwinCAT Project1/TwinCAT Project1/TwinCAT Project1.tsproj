@@ -1,0 +1,153 @@
+<?xml version="1.0"?>
+<TcSmProject xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.beckhoff.com/schemas/2012/07/TcSmProject" TcSmVersion="1.0" TcVersion="3.1.4024.68">
+	<DataTypes>
+		<DataType>
+			<Name GUID="{C280883D-88DA-4D9E-6785-A45C6E79DBD6}" AutoDeleteType="true">S_EMSensorPose</Name>
+			<BitSize>448</BitSize>
+			<SubItem>
+				<Name>lQuaternion</Name>
+				<Type GUID="{18071995-0000-0000-0000-00000000000E}">LREAL</Type>
+				<ArrayInfo>
+					<LBound>0</LBound>
+					<Elements>4</Elements>
+				</ArrayInfo>
+				<Comment><![CDATA[ q0, qx, qy, qz]]></Comment>
+				<BitSize>256</BitSize>
+				<BitOffs>0</BitOffs>
+			</SubItem>
+			<SubItem>
+				<Name>lPos</Name>
+				<Type GUID="{18071995-0000-0000-0000-00000000000E}">LREAL</Type>
+				<ArrayInfo>
+					<LBound>0</LBound>
+					<Elements>3</Elements>
+				</ArrayInfo>
+				<Comment><![CDATA[ X, Y, Z，单位 mm]]></Comment>
+				<BitSize>192</BitSize>
+				<BitOffs>256</BitOffs>
+			</SubItem>
+			<Properties>
+				<Property>
+					<Name>pack_mode</Name>
+					<Value>1</Value>
+				</Property>
+			</Properties>
+		</DataType>
+		<DataType>
+			<Name GUID="{058F4E36-9D65-2C36-3987-82D3CD41A5D9}" AutoDeleteType="true">ST_EMAdsInput</Name>
+			<BitSize>1928</BitSize>
+			<SubItem>
+				<Name>sEMSensorPose</Name>
+				<Type GUID="{C280883D-88DA-4D9E-6785-A45C6E79DBD6}">S_EMSensorPose</Type>
+				<ArrayInfo>
+					<LBound>0</LBound>
+					<Elements>4</Elements>
+				</ArrayInfo>
+				<Comment><![CDATA[ 通道 1..4，与 NDI 上位机一致]]></Comment>
+				<BitSize>1792</BitSize>
+				<BitOffs>0</BitOffs>
+			</SubItem>
+			<SubItem>
+				<Name>lError</Name>
+				<Type GUID="{18071995-0000-0000-0000-00000000000E}">LREAL</Type>
+				<BitSize>64</BitSize>
+				<BitOffs>1792</BitOffs>
+			</SubItem>
+			<SubItem>
+				<Name>lDataScope</Name>
+				<Type GUID="{18071995-0000-0000-0000-00000000000E}">LREAL</Type>
+				<BitSize>64</BitSize>
+				<BitOffs>1856</BitOffs>
+			</SubItem>
+			<SubItem>
+				<Name>bHeatBeat</Name>
+				<Type GUID="{18071995-0000-0000-0000-000000000030}">BOOL</Type>
+				<Comment><![CDATA[ 心跳]]></Comment>
+				<BitSize>8</BitSize>
+				<BitOffs>1920</BitOffs>
+			</SubItem>
+			<Properties>
+				<Property>
+					<Name>pack_mode</Name>
+					<Value>1</Value>
+				</Property>
+			</Properties>
+		</DataType>
+		<DataType>
+			<Name GUID="{E455B0AD-4E62-F662-6222-786C5736ACB3}" AutoDeleteType="true">ST_EMAdsOutput</Name>
+			<BitSize>776</BitSize>
+			<SubItem>
+				<Name>lDataScope</Name>
+				<Type GUID="{18071995-0000-0000-0000-00000000000E}">LREAL</Type>
+				<ArrayInfo>
+					<LBound>0</LBound>
+					<Elements>12</Elements>
+				</ArrayInfo>
+				<Comment><![CDATA[ 示波器变量]]></Comment>
+				<BitSize>768</BitSize>
+				<BitOffs>0</BitOffs>
+			</SubItem>
+			<SubItem>
+				<Name>bHeatBeat</Name>
+				<Type GUID="{18071995-0000-0000-0000-000000000030}">BOOL</Type>
+				<Comment><![CDATA[ 心跳]]></Comment>
+				<BitSize>8</BitSize>
+				<BitOffs>768</BitOffs>
+			</SubItem>
+			<Properties>
+				<Property>
+					<Name>pack_mode</Name>
+					<Value>1</Value>
+				</Property>
+			</Properties>
+		</DataType>
+	</DataTypes>
+	<Project ProjectGUID="{0D318651-82C3-4D42-A5AF-59F6FC3DB526}" Target64Bit="true" ShowHideConfigurations="#x6">
+		<System>
+			<Settings MaxCpus="12" NonWinCpus="6" Packages="4">
+				<Cpu CpuId="6"/>
+			</Settings>
+			<Tasks>
+				<Task Id="3" Priority="20" CycleTime="100000" AmsPort="350" AdtTasks="true">
+					<Name>PlcTask</Name>
+				</Task>
+			</Tasks>
+		</System>
+		<Plc>
+			<Project GUID="{D3937E44-9A87-4257-B097-20C70FAC6375}" Name="Untitled1" PrjFilePath="Untitled1\Untitled1.plcproj" TmcFilePath="Untitled1\Untitled1.tmc" ReloadTmc="true" AmsPort="851" FileArchiveSettings="#x000e" SymbolicMapping="true">
+				<Instance Id="#x08502000" TcSmClass="TComPlcObjDef" KeepUnrestoredLinks="2" TmcPath="Untitled1\Untitled1.tmc" TmcHash="{07AB84FF-E114-3587-788B-26B20F793BB1}">
+					<Name>Untitled1 Instance</Name>
+					<CLSID ClassFactory="TcPlc30">{08500001-0000-0000-F000-000000000064}</CLSID>
+					<Vars VarGrpType="1">
+						<Name>PlcTask Inputs</Name>
+						<Var>
+							<Name>EMSensor.stAdsInput</Name>
+							<Type GUID="{058F4E36-9D65-2C36-3987-82D3CD41A5D9}">ST_EMAdsInput</Type>
+						</Var>
+					</Vars>
+					<Vars VarGrpType="2" AreaNo="1">
+						<Name>PlcTask Outputs</Name>
+						<Var>
+							<Name>EMSensor.stAdsOutput</Name>
+							<Type GUID="{E455B0AD-4E62-F662-6222-786C5736ACB3}">ST_EMAdsOutput</Type>
+						</Var>
+					</Vars>
+					<Contexts>
+						<Context>
+							<Id>0</Id>
+							<Name>PlcTask</Name>
+							<ManualConfig>
+								<OTCID>#x02010030</OTCID>
+							</ManualConfig>
+							<Priority>20</Priority>
+							<CycleTime>10000000</CycleTime>
+						</Context>
+					</Contexts>
+					<TaskPouOids>
+						<TaskPouOid Prio="20" OTCID="#x08502001"/>
+					</TaskPouOids>
+				</Instance>
+			</Project>
+		</Plc>
+	</Project>
+</TcSmProject>

@@ -44,4 +44,7 @@ private:
     FrameCallback onFrame_;
 };
 
+// 与 PLCHmiDemo 相同的 PLC 连接栏：Net IP、端口、指示灯、连接、语言。
+void drawPlcConnectionBar();
+
 } // namespace tcGUICore

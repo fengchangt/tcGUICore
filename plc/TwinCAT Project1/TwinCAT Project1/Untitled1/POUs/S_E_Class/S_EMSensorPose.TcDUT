@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.15">
+  <DUT Name="S_EMSensorPose" Id="{2d95b70d-c0a9-4eb1-9b1c-336c67b87e69}">
+    <Declaration><![CDATA[{attribute 'pack_mode' := '1'}
+TYPE S_EMSensorPose :
+STRUCT
+	lQuaternion 				: ARRAY[0..3] OF LREAL; // q0, qx, qy, qz
+    lPos 						: ARRAY[0..2] OF LREAL; // X, Y, Z，单位 mm
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

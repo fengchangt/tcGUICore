@@ -63,6 +63,9 @@ struct NdiSession::Worker {
     NdiLinkState state = NdiLinkState::Idle;
     std::string message = "未连接";
     std::array<NdiChannelPose, NdiSession::kChannels> poses{};
+    int pollCount = 0;
+    double sampleHz = 0;
+    std::chrono::steady_clock::time_point pollWindow{};
 
     Worker()
     {
@@ -185,10 +188,13 @@ struct NdiSession::Worker {
         });
 
         std::array<NdiChannelPose, NdiSession::kChannels> next{};
-        const int count = std::min(NdiSession::kChannels, static_cast<int>(tools.size()));
-        for (int i = 0; i < count; ++i) {
-            const Transform& tf = tools[static_cast<std::size_t>(i)].transform;
-            NdiChannelPose& pose = next[static_cast<std::size_t>(i)];
+        for (const ToolData& tool : tools) {
+            const int channel = NdiSession::channelNumber(tool.transform.toolHandle);
+            if (channel < 1 || channel > NdiSession::kChannels) {
+                continue;
+            }
+            const Transform& tf = tool.transform;
+            NdiChannelPose& pose = next[static_cast<std::size_t>(channel - 1)];
             pose.present = true;
             pose.valid = !tf.isMissing();
             pose.q0 = tf.q0;
@@ -205,6 +211,18 @@ struct NdiSession::Worker {
         std::lock_guard<std::mutex> lock(mu);
         if (state == NdiLinkState::Tracking) {
             poses = std::move(next);
+            const auto now = std::chrono::steady_clock::now();
+            if (pollWindow.time_since_epoch().count() == 0) {
+                pollWindow = now;
+            }
+            ++pollCount;
+            const auto elapsed = now - pollWindow;
+            if (elapsed >= std::chrono::milliseconds(500)) {
+                const double seconds = std::chrono::duration<double>(elapsed).count();
+                sampleHz = seconds > 0.0 ? static_cast<double>(pollCount) / seconds : 0.0;
+                pollCount = 0;
+                pollWindow = now;
+            }
         }
         return true;
     }
@@ -222,10 +240,6 @@ struct NdiSession::Worker {
                 std::unique_lock<std::mutex> lock(mu);
                 if (!api) {
                     cv.wait(lock, [&] { return stop || wantConnect || wantDisconnect; });
-                } else {
-                    cv.wait_for(lock, std::chrono::milliseconds(20), [&] {
-                        return stop || wantConnect || wantDisconnect;
-                    });
                 }
                 doStop = stop;
                 if (wantDisconnect || stop) {
@@ -271,6 +285,18 @@ NdiSession::~NdiSession()
 {
     delete worker_;
     worker_ = nullptr;
+}
+
+int NdiSession::channelNumber(unsigned handle)
+{
+    if (handle >= 1 && handle <= static_cast<unsigned>(kChannels)) {
+        return static_cast<int>(handle);
+    }
+    // Aurora 传感器接口常见句柄 0x0A..0x0D，对应通道 1..4。
+    if (handle >= 0x0A && handle < 0x0A + static_cast<unsigned>(kChannels)) {
+        return static_cast<int>(handle - 0x0A) + 1;
+    }
+    return -1;
 }
 
 std::vector<std::string> NdiSession::listComPorts()
@@ -355,4 +381,13 @@ std::array<NdiChannelPose, NdiSession::kChannels> NdiSession::poses() const
 {
     std::lock_guard<std::mutex> lock(worker_->mu);
     return worker_->poses;
+}
+
+double NdiSession::sampleHz() const
+{
+    std::lock_guard<std::mutex> lock(worker_->mu);
+    if (worker_->state != NdiLinkState::Tracking) {
+        return 0;
+    }
+    return worker_->sampleHz;
 }
