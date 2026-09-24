@@ -132,20 +132,29 @@ void drawNdiRow(NdiSession& session)
 
 void publishLoop(NdiSession* session, const std::atomic<bool>* stop)
 {
+    // 只使用界面已经建立的那条 PLC 会话。再开一条 AdsLib 会和本机 TwinCAT 路由冲突，
+    // 远端会关掉连接，位姿也写不进去。两次写入之间留出间隔，避免把界面消息泵堵住。
+    constexpr auto kPeriod = std::chrono::milliseconds(5);
     int writeCount = 0;
     auto writeWindow = std::chrono::steady_clock::time_point{};
     auto lastBeat = std::chrono::steady_clock::time_point{};
     uint8_t beat = 0;
     bool poseWarned = false;
+
     while (!stop->load(std::memory_order_relaxed)) {
+        const auto started = std::chrono::steady_clock::now();
         tcGUICore::PlcClient* plc = plcClient();
-        if (!session || !plc || plc->state() != tcGUICore::ConnectionState::Connected) {
+        const bool plcUp = plc && plc->state() == tcGUICore::ConnectionState::Connected;
+        const bool ndiUp = session && session->state() == NdiLinkState::Tracking;
+        if (!session || !plcUp || !ndiUp) {
             gPoseWriteHz = 0;
             writeCount = 0;
             writeWindow = {};
+            poseWarned = false;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
+
         const auto poses = session->poses();
         EmSensorPosePlc blob[NdiSession::kChannels]{};
         for (int i = 0; i < NdiSession::kChannels; ++i) {
@@ -161,28 +170,34 @@ void publishLoop(NdiSession* session, const std::atomic<bool>* stop)
             blob[i].lPos[1] = pose.ty;
             blob[i].lPos[2] = pose.tz;
         }
-        const auto now = std::chrono::steady_clock::now();
         if (plc->writeSymbol(kPoseSymbol, blob, sizeof(blob))) {
             poseWarned = false;
             if (writeWindow.time_since_epoch().count() == 0) {
-                writeWindow = now;
+                writeWindow = started;
             }
             ++writeCount;
-            const auto elapsed = now - writeWindow;
+            const auto elapsed = started - writeWindow;
             if (elapsed >= std::chrono::milliseconds(500)) {
                 const double seconds = std::chrono::duration<double>(elapsed).count();
                 gPoseWriteHz = seconds > 0.0 ? static_cast<double>(writeCount) / seconds : 0.0;
                 writeCount = 0;
-                writeWindow = now;
+                writeWindow = started;
             }
         } else if (!poseWarned) {
             poseWarned = true;
-            tcGUICore::logWarn(std::string(tcGUICore::tr("写入位姿失败 ", "Pose write failed ")) + kPoseSymbol);
+            tcGUICore::logWarn(plc->lastError().empty()
+                ? std::string(tcGUICore::tr("写入位姿失败 ", "Pose write failed ")) + kPoseSymbol
+                : plc->lastError());
         }
-        if (lastBeat.time_since_epoch().count() == 0 || now - lastBeat >= std::chrono::milliseconds(200)) {
-            lastBeat = now;
+        if (lastBeat.time_since_epoch().count() == 0 || started - lastBeat >= std::chrono::milliseconds(200)) {
+            lastBeat = started;
             beat ^= 1;
             plc->writeSymbol(kBeatSymbol, &beat, 1);
+        }
+
+        const auto spent = std::chrono::steady_clock::now() - started;
+        if (spent < kPeriod) {
+            std::this_thread::sleep_for(kPeriod - spent);
         }
     }
 }
@@ -217,6 +232,12 @@ void drawPoseTable(const NdiSession& session)
         "四元数 q0 qx qy qz，位置 X Y Z，单位 mm。通道号即 sEMSensorPose 下标，空通道写 0。",
         "Quaternion q0 qx qy qz and position X Y Z in mm. Channel number is the sEMSensorPose index; empty channels are written as 0."));
     ImGui::Text("NDI %.1f Hz    ADS %.1f Hz", session.sampleHz(), poseWriteHz());
+    tcGUICore::PlcClient* plc = plcClient();
+    const bool passthrough = session.state() == NdiLinkState::Tracking &&
+        plc && plc->state() == tcGUICore::ConnectionState::Connected;
+    ImGui::TextUnformatted(passthrough
+        ? tcGUICore::tr("透传中", "Passing through")
+        : tcGUICore::tr("PLC 与 NDI 都连接后才透传，任一断开即停止", "Passthrough runs only while both PLC and NDI stay connected"));
 
     const auto poses = session.poses();
     const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp;
