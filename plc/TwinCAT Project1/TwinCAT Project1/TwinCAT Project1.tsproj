@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<TcSmProject xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.beckhoff.com/schemas/2012/07/TcSmProject" TcSmVersion="1.0" TcVersion="3.1.4024.68">
+<TcSmProject xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.beckhoff.com/schemas/2012/07/TcSmProject" TcSmVersion="1.0" TcVersion="3.1.4024.59">
 	<DataTypes>
 		<DataType>
 			<Name GUID="{C280883D-88DA-4D9E-6785-A45C6E79DBD6}" AutoDeleteType="true">S_EMSensorPose</Name>
@@ -34,16 +34,16 @@
 			</Properties>
 		</DataType>
 		<DataType>
-			<Name GUID="{058F4E36-9D65-2C36-3987-82D3CD41A5D9}" AutoDeleteType="true">ST_EMAdsInput</Name>
+			<Name GUID="{ED2EF4D4-564F-7F2E-6527-82D17BED2483}" AutoDeleteType="true">ST_EMAdsInput</Name>
 			<BitSize>1928</BitSize>
 			<SubItem>
 				<Name>sEMSensorPose</Name>
 				<Type GUID="{C280883D-88DA-4D9E-6785-A45C6E79DBD6}">S_EMSensorPose</Type>
 				<ArrayInfo>
-					<LBound>0</LBound>
+					<LBound>1</LBound>
 					<Elements>4</Elements>
 				</ArrayInfo>
-				<Comment><![CDATA[ 通道 1..4，与 NDI 上位机一致]]></Comment>
+				<Comment><![CDATA[ 下标=NDI通道号，未接入的通道为 0]]></Comment>
 				<BitSize>1792</BitSize>
 				<BitOffs>0</BitOffs>
 			</SubItem>
@@ -104,7 +104,7 @@
 	</DataTypes>
 	<Project ProjectGUID="{0D318651-82C3-4D42-A5AF-59F6FC3DB526}" Target64Bit="true" ShowHideConfigurations="#x6">
 		<System>
-			<Settings MaxCpus="12" NonWinCpus="6" Packages="4">
+			<Settings MaxCpus="12">
 				<Cpu CpuId="6"/>
 			</Settings>
 			<Tasks>
@@ -115,14 +115,14 @@
 		</System>
 		<Plc>
 			<Project GUID="{D3937E44-9A87-4257-B097-20C70FAC6375}" Name="Untitled1" PrjFilePath="Untitled1\Untitled1.plcproj" TmcFilePath="Untitled1\Untitled1.tmc" ReloadTmc="true" AmsPort="851" FileArchiveSettings="#x000e" SymbolicMapping="true">
-				<Instance Id="#x08502000" TcSmClass="TComPlcObjDef" KeepUnrestoredLinks="2" TmcPath="Untitled1\Untitled1.tmc" TmcHash="{07AB84FF-E114-3587-788B-26B20F793BB1}">
+				<Instance Id="#x08502000" TcSmClass="TComPlcObjDef" KeepUnrestoredLinks="2" TmcPath="Untitled1\Untitled1.tmc" TmcHash="{65687AA9-0ABB-3C34-1347-9D84DFC5E2C0}">
 					<Name>Untitled1 Instance</Name>
 					<CLSID ClassFactory="TcPlc30">{08500001-0000-0000-F000-000000000064}</CLSID>
 					<Vars VarGrpType="1">
 						<Name>PlcTask Inputs</Name>
 						<Var>
 							<Name>EMSensor.stAdsInput</Name>
-							<Type GUID="{058F4E36-9D65-2C36-3987-82D3CD41A5D9}">ST_EMAdsInput</Type>
+							<Type GUID="{ED2EF4D4-564F-7F2E-6527-82D17BED2483}">ST_EMAdsInput</Type>
 						</Var>
 					</Vars>
 					<Vars VarGrpType="2" AreaNo="1">

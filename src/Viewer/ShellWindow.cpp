@@ -551,6 +551,28 @@ struct PlcDim {
     uint32_t count = 0;
 };
 
+// 来自 ADS 数据类型表（ADSIGRP_SYM_DT_UPLOAD）的结构体字段。
+struct PlcTypeMember {
+    std::string name;
+    std::string typeName;
+    std::string comment;
+    uint32_t size = 0;
+    uint32_t offset = 0; // 相对父结构的字节偏移
+    uint32_t dataType = 0;
+    uint32_t elemSize = 0;
+    std::vector<PlcDim> dims;
+};
+
+struct PlcTypeInfo {
+    std::string name;
+    std::string baseType;
+    std::string comment;
+    uint32_t size = 0;
+    uint32_t dataType = 0;
+    std::vector<PlcDim> dims;
+    std::vector<PlcTypeMember> members;
+};
+
 struct PlcRow {
     std::string name;
     std::string typeName;
@@ -561,6 +583,7 @@ struct PlcRow {
     uint32_t offset = 0;
     uint32_t elemSize = 0;
     std::vector<PlcDim> dims;
+    std::vector<PlcTypeMember> members; // 结构体字段（数组元素类型为结构体时也挂在此）
     bool readOnly = false;
 };
 
@@ -568,6 +591,7 @@ struct PlcSymbolList {
     std::string key;
     std::string error;
     std::vector<PlcRow> rows;
+    std::unordered_map<std::string, PlcTypeInfo> types;
 };
 
 std::mutex gSymMu;
@@ -837,6 +861,149 @@ void normalizeArrayRow(PlcRow& row)
     row.elemSize = row.size / static_cast<uint32_t>(count);
 }
 
+void normalizeTypeMember(PlcTypeMember& member)
+{
+    std::vector<PlcDim> fromName;
+    std::string element;
+    if (member.dims.empty() && parseArrayDecl(member.typeName, fromName, element)) {
+        member.dims = std::move(fromName);
+        member.typeName = element;
+    }
+    if (member.dims.empty()) {
+        member.elemSize = 0;
+        if (member.dataType == 0 || member.dataType == 65) {
+            member.dataType = adsTypeOf(member.typeName);
+        }
+        return;
+    }
+    uint64_t count = 1;
+    for (const PlcDim& dim : member.dims) {
+        if (dim.count == 0 || count > (1ull << 20) / dim.count) {
+            member.dims.clear();
+            member.elemSize = 0;
+            return;
+        }
+        count *= dim.count;
+    }
+    if (member.dataType == 0 || member.dataType == 65) {
+        member.dataType = adsTypeOf(member.typeName);
+    }
+    if (member.size == 0 || (member.size % static_cast<uint32_t>(count)) != 0) {
+        member.elemSize = 0;
+        return;
+    }
+    member.elemSize = member.size / static_cast<uint32_t>(count);
+}
+
+bool parseAdsDatatypeEntry(const uint8_t* data, std::size_t bytes, PlcTypeInfo& info, bool asMember, PlcTypeMember* memberOut);
+
+bool parseAdsDatatypeBlob(const uint8_t* data, std::size_t bytes, std::unordered_map<std::string, PlcTypeInfo>& types)
+{
+    std::size_t off = 0;
+    while (off + 42 <= bytes) {
+        const uint32_t entryLength = readU32(data + off);
+        if (entryLength < 42 || off + entryLength > bytes) {
+            break;
+        }
+        PlcTypeInfo info;
+        if (parseAdsDatatypeEntry(data + off, entryLength, info, false, nullptr) && !info.name.empty()) {
+            types[info.name] = std::move(info);
+        }
+        off += entryLength;
+    }
+    return !types.empty();
+}
+
+bool parseAdsDatatypeEntry(const uint8_t* data, std::size_t bytes, PlcTypeInfo& info, bool asMember, PlcTypeMember* memberOut)
+{
+    if (bytes < 42) {
+        return false;
+    }
+    const uint32_t entryLength = readU32(data + 0);
+    if (entryLength < 42 || entryLength > bytes) {
+        return false;
+    }
+    const uint32_t size = readU32(data + 16);
+    const uint32_t offs = readU32(data + 20);
+    const uint32_t dataType = readU32(data + 24);
+    const uint16_t nameLen = readU16(data + 32);
+    const uint16_t typeLen = readU16(data + 34);
+    const uint16_t commentLen = readU16(data + 36);
+    const uint16_t arrayDim = readU16(data + 38);
+    const uint16_t subItems = readU16(data + 40);
+
+    std::size_t cursor = 42;
+    const std::size_t end = entryLength;
+    std::string name;
+    std::string typeName;
+    std::string comment;
+    if (!takeField(data, end, cursor, nameLen, name) ||
+        !takeField(data, end, cursor, typeLen, typeName) ||
+        !takeField(data, end, cursor, commentLen, comment)) {
+        return false;
+    }
+
+    std::vector<PlcDim> dims;
+    dims.reserve(arrayDim);
+    for (uint16_t i = 0; i < arrayDim; ++i) {
+        if (cursor + 8 > end) {
+            return false;
+        }
+        int32_t lower = 0;
+        uint32_t count = 0;
+        std::memcpy(&lower, data + cursor, 4);
+        std::memcpy(&count, data + cursor + 4, 4);
+        cursor += 8;
+        PlcDim dim;
+        dim.lower = lower;
+        dim.count = count;
+        dims.push_back(dim);
+    }
+
+    std::vector<PlcTypeMember> members;
+    members.reserve(subItems);
+    for (uint16_t i = 0; i < subItems; ++i) {
+        if (cursor + 4 > end) {
+            return false;
+        }
+        const uint32_t childLen = readU32(data + cursor);
+        if (childLen < 42 || cursor + childLen > end) {
+            return false;
+        }
+        PlcTypeInfo childInfo;
+        PlcTypeMember childMember;
+        if (!parseAdsDatatypeEntry(data + cursor, childLen, childInfo, true, &childMember)) {
+            return false;
+        }
+        if (!childMember.name.empty()) {
+            normalizeTypeMember(childMember);
+            members.push_back(std::move(childMember));
+        }
+        cursor += childLen;
+    }
+
+    if (asMember && memberOut) {
+        memberOut->name = std::move(name);
+        memberOut->typeName = std::move(typeName);
+        memberOut->comment = std::move(comment);
+        memberOut->size = size;
+        memberOut->offset = offs;
+        memberOut->dataType = dataType;
+        memberOut->dims = std::move(dims);
+        normalizeTypeMember(*memberOut);
+        return true;
+    }
+
+    info.name = std::move(name);
+    info.baseType = std::move(typeName);
+    info.comment = std::move(comment);
+    info.size = size;
+    info.dataType = dataType;
+    info.dims = std::move(dims);
+    info.members = std::move(members);
+    return true;
+}
+
 uint32_t elementCount(const PlcRow& row)
 {
     uint64_t count = 1;
@@ -985,20 +1152,98 @@ bool loadProjectSymbols(const std::string& netId, uint16_t port, std::vector<Plc
     return !rows.empty();
 }
 
-bool querySymbolUploadInfo(PlcClient* plc, uint32_t& count, uint32_t& bytes)
+bool querySymbolUploadInfo(PlcClient* plc, uint32_t& count, uint32_t& bytes, uint32_t& dtCount, uint32_t& dtBytes)
 {
+    dtCount = 0;
+    dtBytes = 0;
     unsigned char buf[64] = {};
     std::size_t got = 0;
-    const uint32_t groups[] = {0xF00F, 0xF00C};
-    const std::size_t lengths[] = {sizeof(buf), 8};
-    for (int i = 0; i < 2; ++i) {
-        got = 0;
-        if (!plc->readBytes(groups[i], 0, buf, lengths[i], &got) || got < 8) {
-            continue;
+    if (plc->readBytes(0xF00F, 0, buf, sizeof(buf), &got) && got >= 8) {
+        std::memcpy(&count, buf, 4);
+        std::memcpy(&bytes, buf + 4, 4);
+        if (got >= 16) {
+            std::memcpy(&dtCount, buf + 8, 4);
+            std::memcpy(&dtBytes, buf + 12, 4);
         }
+        return true;
+    }
+    got = 0;
+    if (plc->readBytes(0xF00C, 0, buf, 8, &got) && got >= 8) {
         std::memcpy(&count, buf, 4);
         std::memcpy(&bytes, buf + 4, 4);
         return true;
+    }
+    return false;
+}
+
+void attachTypeLayout(PlcRow& row, const std::unordered_map<std::string, PlcTypeInfo>& types, int depth = 0)
+{
+    if (depth > 12 || row.typeName.empty()) {
+        return;
+    }
+    const auto it = types.find(row.typeName);
+    if (it == types.end()) {
+        return;
+    }
+    const PlcTypeInfo& info = it->second;
+    if ((row.dataType == 0 || row.dataType == 65) && info.dataType != 0) {
+        row.dataType = info.dataType;
+    }
+
+    // 数组 typedef：dims 在类型上，baseType 是元素类型。
+    if (info.members.empty() && !info.dims.empty() && !info.baseType.empty()) {
+        if (row.dims.empty()) {
+            row.dims = info.dims;
+            row.typeName = info.baseType;
+            if (row.size == 0) {
+                row.size = info.size;
+            }
+            normalizeArrayRow(row);
+        }
+        attachTypeLayout(row, types, depth + 1);
+        return;
+    }
+
+    // 简单别名：TYPE X : INT
+    if (info.members.empty() && info.dims.empty() && !info.baseType.empty() && info.baseType != row.typeName) {
+        if (adsTypeOf(info.baseType) != 0 || types.find(info.baseType) != types.end()) {
+            row.typeName = info.baseType;
+            if (row.dataType == 0 || row.dataType == 65) {
+                row.dataType = info.dataType != 0 ? info.dataType : adsTypeOf(row.typeName);
+            }
+            attachTypeLayout(row, types, depth + 1);
+            return;
+        }
+    }
+
+    if (!info.members.empty()) {
+        row.members = info.members;
+    }
+}
+
+void resolveSymbolLayouts(PlcSymbolList& list)
+{
+    for (PlcRow& row : list.rows) {
+        attachTypeLayout(row, list.types);
+    }
+}
+
+bool uploadPlcDataTypes(PlcClient* plc, uint32_t dtBytes, std::unordered_map<std::string, PlcTypeInfo>& types)
+{
+    if (!plc || dtBytes == 0 || dtBytes > 32u * 1024u * 1024u) {
+        return false;
+    }
+    std::vector<uint8_t> blob(dtBytes);
+    const uint32_t offsets[] = {0u, 0x80000000u};
+    for (uint32_t offs : offsets) {
+        std::size_t got = 0;
+        if (!plc->readBytes(0xF00E, offs, blob.data(), blob.size(), &got) || got < 42) {
+            continue;
+        }
+        types.clear();
+        if (parseAdsDatatypeBlob(blob.data(), got, types)) {
+            return true;
+        }
     }
     return false;
 }
@@ -1009,7 +1254,9 @@ void uploadPlcSymbols(PlcClient* plc, PlcSymbolList& list)
     const std::string netId = plc->sessionAmsNetId();
     uint32_t count = 0;
     uint32_t bytes = 0;
-    if (!querySymbolUploadInfo(plc, count, bytes)) {
+    uint32_t dtCount = 0;
+    uint32_t dtBytes = 0;
+    if (!querySymbolUploadInfo(plc, count, bytes, dtCount, dtBytes)) {
         if (loadProjectSymbols(netId, cfg.adsPort, list.rows)) {
             return;
         }
@@ -1037,7 +1284,12 @@ void uploadPlcSymbols(PlcClient* plc, PlcSymbolList& list)
     }
     if (!parsePlcSymbols(blob.data(), got, count, list.rows)) {
         list.error = tr("PLC 符号表无法解析", "PLC symbol table could not be parsed");
+        return;
     }
+    if (dtBytes > 0) {
+        uploadPlcDataTypes(plc, dtBytes, list.types);
+    }
+    resolveSymbolLayouts(list);
 }
 
 void requestPlcSymbols(PlcClient* plc, const std::string& key)
@@ -1115,22 +1367,33 @@ bool rowIsBasic(const PlcRow& row)
     return rowIsBool(row) || rowIsString(row) || rowIsWString(row) || scalarWidth(row, width);
 }
 
-bool rowIsExpandable(const PlcRow& row)
+bool rowIsArray(const PlcRow& row)
 {
-    if (row.dims.empty() || row.elemSize == 0) {
-        return false;
-    }
-    PlcRow element;
-    element.typeName = row.typeName;
-    element.dataType = row.dataType == 0 || row.dataType == 65 ? adsTypeOf(row.typeName) : row.dataType;
-    element.size = row.elemSize;
-    return rowIsBasic(element);
+    return !row.dims.empty() && row.elemSize > 0 && elementCount(row) > 0;
 }
 
-bool makeElement(const PlcRow& parent, uint32_t linear, PlcRow& out)
+bool rowIsStruct(const PlcRow& row)
+{
+    return !row.members.empty();
+}
+
+bool rowIsExpandable(const PlcRow& row)
+{
+    if (rowIsArray(row)) {
+        PlcRow element;
+        element.typeName = row.typeName;
+        element.dataType = row.dataType == 0 || row.dataType == 65 ? adsTypeOf(row.typeName) : row.dataType;
+        element.size = row.elemSize;
+        element.members = row.members;
+        return rowIsBasic(element) || rowIsStruct(element);
+    }
+    return rowIsStruct(row);
+}
+
+bool makeArrayElement(const PlcRow& parent, uint32_t linear, PlcRow& out)
 {
     const uint32_t count = elementCount(parent);
-    if (!rowIsExpandable(parent) || linear >= count) {
+    if (!rowIsArray(parent) || linear >= count) {
         return false;
     }
     out = parent;
@@ -1142,12 +1405,41 @@ bool makeElement(const PlcRow& parent, uint32_t linear, PlcRow& out)
     out.typeName = parent.typeName;
     out.name = parent.name + formatIndexes(parent.dims, linear);
     out.comment.clear();
+    // 结构体数组成员：沿用父行上的字段布局。
+    out.members = parent.members;
+    return true;
+}
+
+bool makeStructMember(const PlcRow& parent, std::size_t index, PlcRow& out,
+    const std::unordered_map<std::string, PlcTypeInfo>* types)
+{
+    if (index >= parent.members.size()) {
+        return false;
+    }
+    const PlcTypeMember& member = parent.members[index];
+    out = PlcRow{};
+    out.name = parent.name + "." + member.name;
+    out.typeName = member.typeName;
+    out.comment = member.comment;
+    out.size = member.size;
+    out.dataType = member.dataType == 0 || member.dataType == 65 ? adsTypeOf(member.typeName) : member.dataType;
+    out.group = parent.group;
+    out.offset = parent.offset + member.offset;
+    out.dims = member.dims;
+    out.elemSize = member.elemSize;
+    out.readOnly = parent.readOnly;
+    if (out.elemSize == 0 && !out.dims.empty()) {
+        normalizeArrayRow(out);
+    }
+    if (types) {
+        attachTypeLayout(out, *types);
+    }
     return true;
 }
 
 bool rowCanWrite(const PlcRow& row)
 {
-    if (row.readOnly) {
+    if (row.readOnly || rowIsExpandable(row)) {
         return false;
     }
     std::size_t width = 0;
@@ -1365,6 +1657,7 @@ struct SymbolCell {
     char text[96] = "-";
     bool flag = false;
     bool known = false;
+    bool fetched = false; // 已自动/手动拉取过，避免失败时每帧重试
 };
 
 SymbolCell& symbolCell(const std::string& key)
@@ -1388,7 +1681,7 @@ void readPlcRow(PlcClient* plc, const PlcRow& row, SymbolCell& cell)
         n = 1;
     } else if (scalarWidth(row, width) || rowIsString(row) || rowIsWString(row)) {
         n = (rowIsString(row) || rowIsWString(row)) ? row.size : width;
-    } else if (row.size > 0) {
+    } else if (row.size > 0 && !rowIsExpandable(row)) {
         n = std::min<std::size_t>(row.size, 64);
     }
     if (!plc || n == 0) {
@@ -1414,12 +1707,106 @@ std::string cellKeyOf(const PlcRow& row)
     return row.name + "#" + std::to_string(row.offset);
 }
 
-void readArrayElements(PlcClient* plc, const PlcRow& row, SymbolCell& parentCell)
+void fillBasicCell(const PlcRow& row, const uint8_t* raw, std::size_t n, SymbolCell& cell)
 {
-    const uint32_t count = elementCount(row);
-    if (!plc || !rowIsExpandable(row) || count == 0 || row.size == 0 || row.size > 256u * 1024u) {
+    if (!raw || n == 0) {
+        std::snprintf(cell.text, sizeof(cell.text), "-");
+        cell.known = false;
+        cell.fetched = true;
+        return;
+    }
+    cell.flag = raw[0] != 0;
+    cell.known = true;
+    cell.fetched = true;
+    formatPlcValue(row, raw, n, cell.text, sizeof(cell.text));
+}
+
+void fillChildrenFromBuffer(const PlcRow& parent, const uint8_t* raw, std::size_t bytes,
+    const std::unordered_map<std::string, PlcTypeInfo>* types)
+{
+    if (!raw || bytes == 0) {
+        return;
+    }
+    if (rowIsArray(parent)) {
+        const uint32_t shown = std::min(elementCount(parent), 4096u);
+        for (uint32_t i = 0; i < shown; ++i) {
+            PlcRow element;
+            if (!makeArrayElement(parent, i, element)) {
+                continue;
+            }
+            const std::size_t at = static_cast<std::size_t>(i) * parent.elemSize;
+            if (at + element.size > bytes) {
+                break;
+            }
+            if (rowIsBasic(element)) {
+                fillBasicCell(element, raw + at, element.size, symbolCell(cellKeyOf(element)));
+            } else if (rowIsStruct(element)) {
+                fillChildrenFromBuffer(element, raw + at, element.size, types);
+                SymbolCell& cell = symbolCell(cellKeyOf(element));
+                std::snprintf(cell.text, sizeof(cell.text), "%s", tr("已读取", "Read"));
+                cell.known = true;
+                cell.fetched = true;
+            }
+        }
+        return;
+    }
+    if (!rowIsStruct(parent)) {
+        return;
+    }
+    for (std::size_t i = 0; i < parent.members.size(); ++i) {
+        PlcRow child;
+        if (!makeStructMember(parent, i, child, types)) {
+            continue;
+        }
+        if (child.offset < parent.offset) {
+            continue;
+        }
+        const std::size_t at = static_cast<std::size_t>(child.offset - parent.offset);
+        if (at + child.size > bytes) {
+            continue;
+        }
+        if (rowIsBasic(child)) {
+            fillBasicCell(child, raw + at, child.size, symbolCell(cellKeyOf(child)));
+        } else if (rowIsArray(child) && child.members.empty()) {
+            PlcRow probe = child;
+            probe.dims.clear();
+            probe.elemSize = 0;
+            probe.size = child.elemSize ? child.elemSize : child.size;
+            if (rowIsBasic(probe) || (child.elemSize > 0 && adsTypeOf(child.typeName) != 0)) {
+                const uint32_t shown = std::min(elementCount(child), 4096u);
+                for (uint32_t e = 0; e < shown; ++e) {
+                    PlcRow element;
+                    if (!makeArrayElement(child, e, element)) {
+                        continue;
+                    }
+                    const std::size_t elemAt = at + static_cast<std::size_t>(e) * child.elemSize;
+                    if (elemAt + element.size > bytes) {
+                        break;
+                    }
+                    fillBasicCell(element, raw + elemAt, element.size, symbolCell(cellKeyOf(element)));
+                }
+            }
+            SymbolCell& cell = symbolCell(cellKeyOf(child));
+            std::snprintf(cell.text, sizeof(cell.text), "%s", tr("已读取", "Read"));
+            cell.known = true;
+            cell.fetched = true;
+        } else if (rowIsExpandable(child)) {
+            fillChildrenFromBuffer(child, raw + at, child.size, types);
+            SymbolCell& cell = symbolCell(cellKeyOf(child));
+            std::snprintf(cell.text, sizeof(cell.text), "%s", tr("已读取", "Read"));
+            cell.known = true;
+            cell.fetched = true;
+        }
+    }
+}
+
+void readComposite(PlcClient* plc, const PlcRow& row, SymbolCell& parentCell,
+    const std::unordered_map<std::string, PlcTypeInfo>* types)
+{
+    if (!plc || !rowIsExpandable(row) || row.size == 0 || row.size > 256u * 1024u) {
         std::snprintf(parentCell.text, sizeof(parentCell.text), "-");
         parentCell.known = false;
+        parentCell.fetched = true;
         return;
     }
     std::vector<uint8_t> raw(row.size);
@@ -1428,22 +1815,16 @@ void readArrayElements(PlcClient* plc, const PlcRow& row, SymbolCell& parentCell
         const std::string err = plc->lastError();
         std::snprintf(parentCell.text, sizeof(parentCell.text), "%s", err.empty() ? "-" : err.c_str());
         parentCell.known = false;
+        parentCell.fetched = true;
         return;
     }
-    const uint32_t shown = std::min(count, 4096u);
-    for (uint32_t i = 0; i < shown; ++i) {
-        PlcRow element;
-        if (!makeElement(row, i, element)) {
-            continue;
-        }
-        SymbolCell& cell = symbolCell(cellKeyOf(element));
-        const std::size_t at = static_cast<std::size_t>(i) * row.elemSize;
-        formatPlcValue(element, raw.data() + at, row.elemSize, cell.text, sizeof(cell.text));
-        cell.flag = raw[at] != 0;
-        cell.known = true;
+    fillChildrenFromBuffer(row, raw.data(), got, types);
+    if (rowIsArray(row) && !rowIsStruct(row)) {
+        // 基本类型数组：父行显示“已读取”
     }
     std::snprintf(parentCell.text, sizeof(parentCell.text), "%s", tr("已读取", "Read"));
     parentCell.known = true;
+    parentCell.fetched = true;
 }
 
 void writePlcRow(PlcClient* plc, const PlcRow& row, SymbolCell& cell)
@@ -1567,55 +1948,105 @@ void drawSymbolTable()
     ImGui::TableHeadersRow();
 
     struct ViewItem {
-        int symbol = 0;
-        int linear = -1;
+        PlcRow row;
+        int depth = 0;
     };
-    static std::unordered_set<std::string> openArrays;
+    static std::unordered_set<std::string> openNodes;
     std::vector<ViewItem> view;
-    view.reserve(static_cast<std::size_t>(rowCount));
-    for (int i = 0; i < rowCount; ++i) {
-        const int index = useFilter ? filtered[static_cast<std::size_t>(i)] : i;
-        view.push_back(ViewItem{index, -1});
-        const PlcRow& row = list->rows[static_cast<std::size_t>(index)];
-        if (rowIsExpandable(row) && openArrays.find(row.name) != openArrays.end()) {
+    view.reserve(static_cast<std::size_t>(rowCount) * 2u);
+
+    const auto appendExpanded = [&](auto&& self, const PlcRow& row, int depth) -> void {
+        if (openNodes.find(row.name) == openNodes.end() || depth > 12) {
+            return;
+        }
+        if (rowIsArray(row)) {
             const uint32_t shown = std::min(elementCount(row), 4096u);
-            for (uint32_t element = 0; element < shown; ++element) {
-                view.push_back(ViewItem{index, static_cast<int>(element)});
+            for (uint32_t i = 0; i < shown; ++i) {
+                PlcRow child;
+                if (!makeArrayElement(row, i, child)) {
+                    continue;
+                }
+                view.push_back(ViewItem{child, depth});
+                self(self, child, depth + 1);
+            }
+            return;
+        }
+        if (rowIsStruct(row)) {
+            for (std::size_t i = 0; i < row.members.size(); ++i) {
+                PlcRow child;
+                if (!makeStructMember(row, i, child, &list->types)) {
+                    continue;
+                }
+                view.push_back(ViewItem{child, depth});
+                self(self, child, depth + 1);
             }
         }
+    };
+
+    for (int i = 0; i < rowCount; ++i) {
+        const int index = useFilter ? filtered[static_cast<std::size_t>(i)] : i;
+        const PlcRow& row = list->rows[static_cast<std::size_t>(index)];
+        view.push_back(ViewItem{row, 0});
+        appendExpanded(appendExpanded, row, 1);
     }
+
+    // 展开 SymbolsScope / 滚动可见行时自动读初值；限制每帧 ADS 次数，避免卡死 UI。
+    int autoReadsLeft = 16;
+    const std::unordered_map<std::string, PlcTypeInfo>* types = &list->types;
 
     ImGuiListClipper clipper;
     clipper.Begin(static_cast<int>(view.size()));
     while (clipper.Step()) {
         for (int rowIndex = clipper.DisplayStart; rowIndex < clipper.DisplayEnd; ++rowIndex) {
-            const ViewItem item = view[static_cast<std::size_t>(rowIndex)];
-            const PlcRow& parent = list->rows[static_cast<std::size_t>(item.symbol)];
-            PlcRow element;
-            const bool child = item.linear >= 0 && makeElement(parent, static_cast<uint32_t>(item.linear), element);
-            const PlcRow& row = child ? element : parent;
-            const bool expandable = !child && rowIsExpandable(parent);
+            const ViewItem& item = view[static_cast<std::size_t>(rowIndex)];
+            const PlcRow& row = item.row;
+            const bool expandable = rowIsExpandable(row);
             SymbolCell& cell = symbolCell(cellKeyOf(row));
-            const bool canWrite = !expandable && rowCanWrite(row);
+            const bool canWrite = rowCanWrite(row);
+            const bool nodeOpen = expandable && openNodes.find(row.name) != openNodes.end();
+
+            if (autoReadsLeft > 0) {
+                if (expandable && nodeOpen && !cell.fetched) {
+                    cell.fetched = true;
+                    --autoReadsLeft;
+                    readComposite(plc, row, cell, types);
+                } else if (!expandable && !cell.fetched) {
+                    cell.fetched = true;
+                    --autoReadsLeft;
+                    readPlcRow(plc, row, cell);
+                }
+            }
+
             ImGui::TableNextRow();
-            ImGui::PushID(item.symbol);
-            ImGui::PushID(item.linear + 1);
+            ImGui::PushID(row.name.c_str());
+            ImGui::PushID(static_cast<int>(row.offset));
             ImGui::TableSetColumnIndex(0);
             ImGui::AlignTextToFramePadding();
+            if (item.depth > 0) {
+                ImGui::Dummy(ImVec2(static_cast<float>(item.depth) * 12.0f, 0.0f));
+                ImGui::SameLine();
+            }
             if (expandable) {
-                const bool open = openArrays.find(parent.name) != openArrays.end();
-                if (ImGui::ArrowButton("##exp", open ? ImGuiDir_Down : ImGuiDir_Right)) {
-                    if (open) {
-                        openArrays.erase(parent.name);
+                if (ImGui::ArrowButton("##exp", nodeOpen ? ImGuiDir_Down : ImGuiDir_Right)) {
+                    if (nodeOpen) {
+                        openNodes.erase(row.name);
                     } else {
-                        openArrays.insert(parent.name);
+                        openNodes.insert(row.name);
+                        if (!cell.fetched) {
+                            cell.fetched = true;
+                            readComposite(plc, row, cell, types);
+                        }
                     }
                 }
                 ImGui::SameLine();
             }
             ImGui::TextUnformatted(row.name.c_str());
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(expandable ? arrayTypeLabel(parent).c_str() : row.typeName.c_str());
+            if (rowIsArray(row)) {
+                ImGui::TextUnformatted(arrayTypeLabel(row).c_str());
+            } else {
+                ImGui::TextUnformatted(row.typeName.c_str());
+            }
             ImGui::TableSetColumnIndex(2);
             ImGui::TextUnformatted(row.comment.c_str());
             ImGui::TableSetColumnIndex(3);
@@ -1627,13 +2058,18 @@ void drawSymbolTable()
             ImGui::TableSetColumnIndex(4);
             ImGui::SetNextItemWidth(-FLT_MIN);
             if (expandable) {
-                const uint32_t count = elementCount(parent);
                 if (!cell.known && cell.text[0] != '\0' && std::strcmp(cell.text, "-") != 0) {
                     ImGui::TextUnformatted(cell.text);
-                } else if (count > 4096u) {
-                    ImGui::Text("%u %s", count, tr("个元素，展开前 4096 个", "elements, first 4096 shown"));
+                } else if (rowIsArray(row)) {
+                    const uint32_t count = elementCount(row);
+                    if (count > 4096u) {
+                        ImGui::Text("%u %s", count, tr("个元素，展开前 4096 个", "elements, first 4096 shown"));
+                    } else {
+                        ImGui::Text("%u %s", count, tr("个元素", "elements"));
+                    }
                 } else {
-                    ImGui::Text("%u %s", count, tr("个元素", "elements"));
+                    ImGui::Text("%u %s", static_cast<unsigned>(row.members.size()),
+                        tr("个字段", "fields"));
                 }
             } else if (rowIsBool(row) && cell.known && canWrite) {
                 ImGui::Checkbox("##value", &cell.flag);
@@ -1644,8 +2080,9 @@ void drawSymbolTable()
             }
             ImGui::TableSetColumnIndex(5);
             if (ImGui::SmallButton(tr("读取##sym_read", "Read##sym_read"))) {
+                cell.fetched = true;
                 if (expandable) {
-                    readArrayElements(plc, parent, cell);
+                    readComposite(plc, row, cell, types);
                 } else {
                     readPlcRow(plc, row, cell);
                 }
@@ -1694,10 +2131,15 @@ void drawSelectedLabel()
 
 void drawFrameFooter(const ImGuiViewport* vp)
 {
+    // 始终钉在工作区右下角，不依赖产品页布局是否预留了底栏。
     char fps[32];
     std::snprintf(fps, sizeof(fps), "FPS: %.0f", ImGui::GetIO().Framerate);
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(fps).x);
-    ImGui::TextUnformatted(fps);
+    const ImVec2 textSize = ImGui::CalcTextSize(fps);
+    constexpr float pad = 10.0f;
+    const ImVec2 pos(
+        vp->WorkPos.x + vp->WorkSize.x - textSize.x - pad,
+        vp->WorkPos.y + vp->WorkSize.y - textSize.y - pad);
+    ImGui::GetForegroundDrawList()->AddText(pos, ImGui::GetColorU32(ImGuiCol_TextDisabled), fps);
 
     const bool maximized = gChrome.window && glfwGetWindowAttrib(gChrome.window, GLFW_MAXIMIZED);
     const float rounding = maximized ? 0.0f : kCornerRadius;
@@ -1885,24 +2327,35 @@ int ShellWindow::run()
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
     GLFWwindow* window = glfwCreateWindow(window_.width, window_.height, title_.c_str(), nullptr, nullptr);
 #else
-    // Ubuntu 虚拟机一般有 OpenGL 3.3。树莓派桌面多为 3.1，失败后再降一档。
+    // Ubuntu 虚拟机一般有 OpenGL 3.3。树莓派桌面多为 3.1 / ES3，逐级降级。
     GLFWwindow* window = nullptr;
-    const int glVersions[][3] = {
-        {3, 3, GLFW_OPENGL_CORE_PROFILE},
-        {3, 1, GLFW_OPENGL_ANY_PROFILE},
+    struct GlAttempt {
+        int major;
+        int minor;
+        int profile;
+        int clientApi;
+        const char* glsl;
     };
-    const char* glslForVersion[] = {"#version 330", "#version 140"};
-    for (int attempt = 0; attempt < 2 && !window; ++attempt) {
+    const GlAttempt glAttempts[] = {
+        {3, 3, GLFW_OPENGL_CORE_PROFILE, GLFW_OPENGL_API, "#version 330"},
+        {3, 1, GLFW_OPENGL_ANY_PROFILE, GLFW_OPENGL_API, "#version 140"},
+        {3, 0, GLFW_OPENGL_ANY_PROFILE, GLFW_OPENGL_ES_API, "#version 300 es"},
+    };
+    for (const GlAttempt& attempt : glAttempts) {
         glfwDefaultWindowHints();
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, glVersions[attempt][0]);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, glVersions[attempt][1]);
-        glfwWindowHint(GLFW_OPENGL_PROFILE, glVersions[attempt][2]);
+        glfwWindowHint(GLFW_CLIENT_API, attempt.clientApi);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, attempt.major);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, attempt.minor);
+        if (attempt.clientApi == GLFW_OPENGL_API) {
+            glfwWindowHint(GLFW_OPENGL_PROFILE, attempt.profile);
+        }
         glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE);
         glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
         glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
         window = glfwCreateWindow(window_.width, window_.height, title_.c_str(), nullptr, nullptr);
         if (window) {
-            glslVersion = glslForVersion[attempt];
+            glslVersion = attempt.glsl;
+            break;
         }
     }
 #endif
@@ -1925,6 +2378,14 @@ int ShellWindow::run()
     glfwShowWindow(window);
 #ifdef _WIN32
     updateWindowCorners(window);
+#else
+    // 触摸屏外发：export TCGUICORE_MAXIMIZE=1 启动时最大化。
+    if (const char* maximize = std::getenv("TCGUICORE_MAXIMIZE")) {
+        if (maximize[0] == '1' || maximize[0] == 'y' || maximize[0] == 'Y' || maximize[0] == 't' ||
+            maximize[0] == 'T') {
+            glfwMaximizeWindow(window);
+        }
+    }
 #endif
 
     IMGUI_CHECKVERSION();

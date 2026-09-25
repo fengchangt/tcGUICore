@@ -50,6 +50,9 @@ tcGUICore/
   example/
     PLCHmiDemo/           只加载 JSON，使用库自带界面
     NDIEMSensor/          自绘 NDI + PLC 连接界面
+    RobotConsole/         SurgeonConsole（树莓派扶手触摸屏，Win/Linux 同名）
+  scripts/
+    build_surgeon_console_pi.sh   树莓派本机编译
   thirdparty/             ImGui、ImPlot、GLFW、AdsLib、NDI
 ```
 
@@ -109,6 +112,7 @@ cmake --build build
 
 - `bin/win-x64/release/PLCHmiDemo.exe`
 - `bin/win-x64/release/NDIEMSensor.exe`
+- `bin/win-x64/release/SurgeonConsole.exe`（医生控制台，跨平台统一名）
 
 Linux 示例：
 
@@ -116,6 +120,17 @@ Linux 示例：
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+### 树莓派 5（SurgeonConsole）
+
+同一工程、同一产物名。请在 **树莓派本机**（aarch64）编译：
+
+```bash
+chmod +x scripts/build_surgeon_console_pi.sh
+./scripts/build_surgeon_console_pi.sh
+```
+
+产物：`bin/lin-arm64/release/SurgeonConsole`。详见 `example/RobotConsole/README.md`。
 
 两个样例的 CMake 都要求已经生成 `NDI_CombinedApi`。默认 `TCGUICORE_ENABLE_NDI=ON`，且 `thirdparty/NDI` 存在时会生成该目标。若关掉 NDI，样例会被跳过。
 

@@ -1,5 +1,6 @@
 # C++ / CMake 编译产物（本仓库输出，不含 thirdparty 里自带的库）
 /build/
+/build-pi/
 /bin/
 /lib/
 /out/

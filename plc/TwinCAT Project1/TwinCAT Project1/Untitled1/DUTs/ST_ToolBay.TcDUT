@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.15">
+  <DUT Name="ST_ToolBay" Id="{a1b2c3d4-e5f6-4789-a012-3456789abc02}">
+    <Declaration><![CDATA[{attribute 'pack_mode' := '1'}
+TYPE ST_ToolBay :
+STRUCT
+	bToolPresent		: BOOL;	(* 器械在位 *)
+	bIsolatorPresent	: BOOL;	(* 隔离板在位；器械在位时必须为 TRUE *)
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

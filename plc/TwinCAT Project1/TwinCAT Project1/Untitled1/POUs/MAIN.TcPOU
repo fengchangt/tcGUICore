@@ -3,24 +3,33 @@
   <POU Name="MAIN" Id="{768887be-c808-4342-97c7-6a09e98fd057}" SpecialFunc="None">
     <Declaration><![CDATA[PROGRAM MAIN
 VAR
-	bInit		: BOOL;
-	arrData		: ARRAY[0..2] OF UINT;
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
+	bInit	: BOOL;
+	i		: INT;
 END_VAR
 ]]></Declaration>
     <Implementation>
-      <ST><![CDATA[]]></ST>
+      <ST><![CDATA[IF NOT bInit THEN
+	FOR i := 0 TO 2 DO
+		GVL_Surgeon.arrToolBay[i].bToolPresent := TRUE;
+		GVL_Surgeon.arrToolBay[i].bIsolatorPresent := TRUE;
+	END_FOR
+	GVL_Surgeon.eMsMode := E_MsMode.eMsReleased;
+	bInit := TRUE;
+END_IF
+
+(* 医生控制台解锁：收到 HMI 标志后释放主从锁定 *)
+IF GVL_Surgeon.bUserUnlock THEN
+	GVL_Surgeon.eMsMode := E_MsMode.eMsReleased;
+	GVL_Surgeon.bUserUnlock := FALSE;
+END_IF
+
+(* 规则：器械在位 ⇒ 隔离板必在位 *)
+FOR i := 0 TO 2 DO
+	IF GVL_Surgeon.arrToolBay[i].bToolPresent THEN
+		GVL_Surgeon.arrToolBay[i].bIsolatorPresent := TRUE;
+	END_IF
+END_FOR
+]]></ST>
     </Implementation>
     <LineIds Name="MAIN">
       <LineId Id="2" Count="0" />

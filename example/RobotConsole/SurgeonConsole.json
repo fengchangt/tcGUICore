@@ -1,0 +1,78 @@
+{
+  "_doc": {
+    "zh": "Surgeon Console 专用 PLC 映射。代码只认 name；PLC 地址变了只改 symbol。",
+    "en": "Surgeon Console PLC map. Code binds to name; change symbol when ADS path changes."
+  },
+  "window": {
+    "width": 1600,
+    "height": 900,
+    "language": "zh"
+  },
+  "plcs": [
+    {
+      "id": "master",
+      "displayName": { "zh": "Control Core", "en": "Control Core" },
+      "ip": "127.0.0.1",
+      "adsPort": 851,
+      "timeoutMs": 2000,
+      "variables": [
+        {
+          "name": "tool0",
+          "symbol": "GVL_Surgeon.arrToolBay[0].bToolPresent",
+          "type": "bool",
+          "direction": "output",
+          "label": { "zh": "左器械在位", "en": "Left tool" }
+        },
+        {
+          "name": "isolator0",
+          "symbol": "GVL_Surgeon.arrToolBay[0].bIsolatorPresent",
+          "type": "bool",
+          "direction": "output",
+          "label": { "zh": "左隔离板", "en": "Left isolator" }
+        },
+        {
+          "name": "tool1",
+          "symbol": "GVL_Surgeon.arrToolBay[1].bToolPresent",
+          "type": "bool",
+          "direction": "output",
+          "label": { "zh": "内镜在位", "en": "Scope tool" }
+        },
+        {
+          "name": "isolator1",
+          "symbol": "GVL_Surgeon.arrToolBay[1].bIsolatorPresent",
+          "type": "bool",
+          "direction": "output",
+          "label": { "zh": "内镜隔离板", "en": "Scope isolator" }
+        },
+        {
+          "name": "tool2",
+          "symbol": "GVL_Surgeon.arrToolBay[2].bToolPresent",
+          "type": "bool",
+          "direction": "output",
+          "label": { "zh": "右器械在位", "en": "Right tool" }
+        },
+        {
+          "name": "isolator2",
+          "symbol": "GVL_Surgeon.arrToolBay[2].bIsolatorPresent",
+          "type": "bool",
+          "direction": "output",
+          "label": { "zh": "右隔离板", "en": "Right isolator" }
+        },
+        {
+          "name": "msMode",
+          "symbol": "GVL_Surgeon.eMsMode",
+          "type": "int16",
+          "direction": "input",
+          "label": { "zh": "主从模式", "en": "MS mode" }
+        },
+        {
+          "name": "userUnlock",
+          "symbol": "GVL_Surgeon.bUserUnlock",
+          "type": "bool",
+          "direction": "output",
+          "label": { "zh": "用户解锁", "en": "User unlock" }
+        }
+      ]
+    }
+  ]
+}

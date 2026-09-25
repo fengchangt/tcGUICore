@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.15">
+  <GVL Name="GVL_Surgeon" Id="{a1b2c3d4-e5f6-4789-a012-3456789abc03}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'pack_mode' := '1'}
+VAR_GLOBAL
+	(* 0=左器械 1=内镜 2=右器械 *)
+	arrToolBay		: ARRAY[0..2] OF ST_ToolBay;
+	eMsMode			: E_MsMode := E_MsMode.eMsReleased;
+	bUserUnlock		: BOOL;	(* HMI → PLC 解锁请求，处理后由 MAIN 清零 *)
+END_VAR
+]]></Declaration>
+  </GVL>
+</TcPlcObject>

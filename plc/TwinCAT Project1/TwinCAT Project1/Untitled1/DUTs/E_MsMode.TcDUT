@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.15">
+  <DUT Name="E_MsMode" Id="{a1b2c3d4-e5f6-4789-a012-3456789abc01}">
+    <Declaration><![CDATA[{attribute 'strict'}
+TYPE E_MsMode :
+(
+	eMsReleased := 0,	(* 主从释放：屏幕可操作 *)
+	eMsPaired   := 1	(* 主从锁定：屏幕锁定，需用户解锁 *)
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

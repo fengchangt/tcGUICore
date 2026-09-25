@@ -4,6 +4,7 @@
 #include "Common/I18n.h"
 #include "tcGUICore.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -12,16 +13,11 @@
 namespace {
 
 constexpr const char* kMasterId = "master";
-constexpr const char* kSlaveId = "slave";
+constexpr float kBootSeconds = 3.6f;
+constexpr float kPlcRetrySec = 1.5f;
 
-enum class Page { Gallery, Plc, Status, Master, Slave };
-
-struct RobotSetup {
-    int mode = 0;
-    float speed = 20.0f;
-    bool enable = false;
-    char tool[64] = "Tool-A";
-};
+enum class Phase { Boot, Login, Home };
+enum class HomePage { Instruments, Plc, Status };
 
 struct LoginForm {
     char user[64] = "admin";
@@ -29,40 +25,47 @@ struct LoginForm {
     bool failed = false;
 };
 
-Page gPage = Page::Gallery;
-bool gAuthed = false;
-LoginForm gLogin;
-RobotSetup gMasterSetup{0, 20.0f, false, "Tool-A"};
-RobotSetup gSlaveSetup{1, 35.0f, false, "Tool-B"};
-float gLinkHistory[90]{};
-int gLinkCount = 0;
-double gLinkStamp = 0.0;
-
-struct GalleryState {
-    bool ledOn = true;
-    bool toggleOn = true;
-    float slider = 42.0f;
-    int chip = 0;
-    int combo = 1;
-    bool primaryDown = false;
-    bool secondaryDown = false;
-    bool iconOn = true;
-    bool checked = true;
-    int radio = 0;
-    int port = 851;
-    char text[64] = "Tool-A";
-    float wave[48]{};
+struct ToolSlot {
+    bool toolPresent = false;      // 器械在位
+    bool isolatorPresent = false;  // 隔离板在位（器械在位时必为 true）
+    tcGUICore::LocalizedText typeName;
 };
-
-GalleryState gGallery;
 
 struct Endpoint {
     char ip[64];
     int port = 851;
 };
 
-Endpoint gMasterEp{"172.13.158.13", 851};
-Endpoint gSlaveEp{"172.13.158.17", 851};
+Phase gPhase = Phase::Boot;
+HomePage gHomePage = HomePage::Instruments;
+bool gAuthed = false;
+LoginForm gLogin;
+Endpoint gMasterEp{"127.0.0.1", 851};
+double gBootStart = -1.0;
+double gLastPlcTry = -1.0;
+
+// 舱位顺序：左器械滚筒 | 内镜滚筒 | 右器械滚筒。演示默认：夹钳 / 内镜 / 电刀。
+// 顺序：安装 隔离板→器械；拆卸 器械→隔离板。
+ToolSlot gTools[3] = {
+    {true, true, {"夹钳", "Clamp"}},
+    {true, true, {"内镜", "Endoscope"}},
+    {true, true, {"电刀", "Electrosurgery"}},
+};
+
+// 舱底色块填充高度动画：0 → 隔离板 1/6 → 器械满槽。
+float gBayFillAnim[3] = {1.0f, 1.0f, 1.0f};
+
+void enforceToolRules(ToolSlot& slot)
+{
+    if (slot.toolPresent) {
+        slot.isolatorPresent = true;
+    }
+}
+
+constexpr const char* kToolNames[3] = {"tool0", "tool1", "tool2"};
+constexpr const char* kIsoNames[3] = {"isolator0", "isolator1", "isolator2"};
+constexpr int16_t kMsReleased = 0;
+constexpr int16_t kMsPaired = 1;
 
 tcGUICore::PlcClient* clientOf(const char* id)
 {
@@ -85,445 +88,320 @@ bool connecting(const char* id)
     return plc && plc->state() == tcGUICore::ConnectionState::Connecting;
 }
 
-void connectPlc(const char* id, const Endpoint& ep)
+bool masterReady()
+{
+    return linked(kMasterId);
+}
+
+tcGUICore::RuntimeVariable* plcVar(const char* name)
 {
     tcGUICore::Application* app = tcGUICore::Application::instance();
-    tcGUICore::PlcClient* plc = clientOf(id);
-    if (!app || !plc || plc->state() == tcGUICore::ConnectionState::Connecting) {
+    if (!app || !name) {
+        return nullptr;
+    }
+    return app->ads().variable(kMasterId, name);
+}
+
+bool writePlcBool(const char* name, bool value)
+{
+    tcGUICore::RuntimeVariable* var = plcVar(name);
+    if (!var) {
+        return false;
+    }
+    const uint8_t b = value ? 1 : 0;
+    return tcGUICore::Application::instance()->ads().writeFromUi(*var, &b, 1);
+}
+
+bool readPlcBool(const char* name, bool fallback)
+{
+    tcGUICore::RuntimeVariable* var = plcVar(name);
+    if (!var || !var->ok) {
+        return fallback;
+    }
+    return var->data[0] != 0;
+}
+
+int16_t readMsMode()
+{
+    tcGUICore::RuntimeVariable* var = plcVar("msMode");
+    if (!var || !var->ok) {
+        return kMsReleased;
+    }
+    int16_t mode = 0;
+    std::memcpy(&mode, var->data.data(), sizeof(mode));
+    return mode;
+}
+
+bool msScreenLocked()
+{
+    return masterReady() && readMsMode() == kMsPaired;
+}
+
+void syncToolsFromPlc()
+{
+    if (!masterReady()) {
         return;
     }
-    if (plc->state() == tcGUICore::ConnectionState::Connected) {
+    for (int i = 0; i < 3; ++i) {
+        gTools[i].toolPresent = readPlcBool(kToolNames[i], gTools[i].toolPresent);
+        gTools[i].isolatorPresent = readPlcBool(kIsoNames[i], gTools[i].isolatorPresent);
+        enforceToolRules(gTools[i]);
+    }
+}
+
+void applyToolPresent(int index, bool present)
+{
+    if (index < 0 || index > 2) {
+        return;
+    }
+    // 顺序：先装隔离板，再装器械；拆卸器械不依赖其它。
+    if (present && !gTools[index].isolatorPresent) {
+        return;
+    }
+    gTools[index].toolPresent = present;
+    enforceToolRules(gTools[index]);
+    writePlcBool(kToolNames[index], gTools[index].toolPresent);
+    writePlcBool(kIsoNames[index], gTools[index].isolatorPresent);
+}
+
+void applyIsolatorPresent(int index, bool present)
+{
+    if (index < 0 || index > 2) {
+        return;
+    }
+    // 顺序：器械未拆卸则不能拆隔离板。
+    if (!present && gTools[index].toolPresent) {
+        return;
+    }
+    gTools[index].isolatorPresent = present;
+    enforceToolRules(gTools[index]);
+    writePlcBool(kToolNames[index], gTools[index].toolPresent);
+    writePlcBool(kIsoNames[index], gTools[index].isolatorPresent);
+}
+
+void requestUserUnlock()
+{
+    writePlcBool("userUnlock", true);
+}
+
+void tryConnectMaster()
+{
+    tcGUICore::Application* app = tcGUICore::Application::instance();
+    tcGUICore::PlcClient* plc = clientOf(kMasterId);
+    if (!app || !plc) {
+        return;
+    }
+    const auto state = plc->state();
+    if (state == tcGUICore::ConnectionState::Connected ||
+        state == tcGUICore::ConnectionState::Connecting) {
+        return;
+    }
+    // Error / Disconnected：清掉上次失败会话后再连，登录页持续自动重试。
+    if (state == tcGUICore::ConnectionState::Error) {
         plc->disconnect();
-        return;
     }
-    const auto port = static_cast<uint16_t>(ep.port > 0 && ep.port < 65536 ? ep.port : 851);
-    app->ads().applyConnectionSettings(id, ep.ip, port, tcGUICore::amsNetIdFromIp(ep.ip));
+    const auto port = static_cast<uint16_t>(gMasterEp.port > 0 && gMasterEp.port < 65536 ? gMasterEp.port : 851);
+    app->ads().applyConnectionSettings(kMasterId, gMasterEp.ip, port, tcGUICore::amsNetIdFromIp(gMasterEp.ip));
     plc->connectAsync();
 }
 
-void sampleLink()
+void pollMasterLink()
 {
     const double now = ImGui::GetTime();
-    if (now - gLinkStamp < 0.5) {
-        return;
-    }
-    gLinkStamp = now;
-    const float sample = (linked(kMasterId) ? 0.55f : 0.08f) + (linked(kSlaveId) ? 0.45f : 0.0f);
-    if (gLinkCount < IM_ARRAYSIZE(gLinkHistory)) {
-        gLinkHistory[gLinkCount++] = sample;
-        return;
-    }
-    std::memmove(gLinkHistory, gLinkHistory + 1, sizeof(gLinkHistory) - sizeof(float));
-    gLinkHistory[IM_ARRAYSIZE(gLinkHistory) - 1] = sample;
-}
-
-void drawEndpointCard(const char* title, const char* role, const char* id, Endpoint& ep)
-{
-    tcGUICore::PlcClient* plc = clientOf(id);
-    const bool on = linked(id);
-    const bool busy = connecting(id);
-    tcGUICore::dash::beginCard(id, ImVec2(0.0f, 292.0f));
-    tcGUICore::dash::caption(role);
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 36.0f);
-    tcGUICore::dash::led(on);
-    tcGUICore::dash::title(title, 24.0f);
-    ImGui::Spacing();
-    tcGUICore::dash::caption("IP");
-    ImGui::SetNextItemWidth(-1.0f);
-    tcGUICore::dash::textField((std::string("##ip") + id).c_str(), ep.ip, sizeof(ep.ip));
-    tcGUICore::dash::caption(tcGUICore::tr("端口", "Port"));
-    ImGui::SetNextItemWidth(160.0f);
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, tcGUICore::dash::palette().field);
-    ImGui::PushStyleColor(ImGuiCol_Text, tcGUICore::dash::palette().text);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
-    ImGui::InputInt((std::string("##port") + id).c_str(), &ep.port);
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(2);
-    if (ep.port < 1) {
-        ep.port = 851;
-    }
-    ImGui::Spacing();
-    tcGUICore::dash::progress(busy ? -1.0f : (on ? 1.0f : 0.0f));
-    ImGui::Spacing();
-    const char* label = on ? tcGUICore::tr("断开", "Disconnect") : tcGUICore::tr("连接", "Connect");
-    if (tcGUICore::dash::button(label, ImVec2(148.0f, 38.0f), !on) && !busy) {
-        connectPlc(id, ep);
-    }
-    ImGui::SameLine();
-    if (plc) {
-        tcGUICore::dash::hint(on ? plc->adsStateText().c_str() : plc->statusText().c_str());
-    }
-    tcGUICore::dash::endCard();
-}
-
-void drawPlcPage()
-{
-    tcGUICore::dash::hint(tcGUICore::tr("两台控制器可以同时在线。", "Both controllers can stay online together."));
-    ImGui::Spacing();
-    const float gap = 16.0f;
-    const float avail = ImGui::GetContentRegionAvail().x;
-    const bool wide = avail >= 760.0f;
-    const float width = wide ? (avail - gap) * 0.5f : avail;
-    ImGui::BeginGroup();
-    ImGui::PushItemWidth(width);
-    drawEndpointCard(tcGUICore::tr("主机器人", "Master"), "MASTER", kMasterId, gMasterEp);
-    ImGui::PopItemWidth();
-    ImGui::EndGroup();
-    if (wide) {
-        ImGui::SameLine(0.0f, gap);
-    } else {
-        ImGui::Spacing();
-    }
-    drawEndpointCard(tcGUICore::tr("从机器人", "Slave"), "SLAVE", kSlaveId, gSlaveEp);
-}
-
-void drawMetric(const char* id, const char* label, const char* value, const char* note, float fraction, bool on)
-{
-    tcGUICore::dash::beginCard(id, ImVec2(0.0f, 138.0f));
-    tcGUICore::dash::caption(label);
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 36.0f);
-    tcGUICore::dash::led(on);
-    tcGUICore::dash::title(value, 26.0f);
-    tcGUICore::dash::progress(fraction);
-    ImGui::Spacing();
-    tcGUICore::dash::hint(note);
-    tcGUICore::dash::endCard();
-}
-
-void drawStatusPage()
-{
-    const bool masterOn = linked(kMasterId);
-    const bool slaveOn = linked(kSlaveId);
-    tcGUICore::PlcClient* master = clientOf(kMasterId);
-    tcGUICore::PlcClient* slave = clientOf(kSlaveId);
-    const float gap = 16.0f;
-    const float avail = ImGui::GetContentRegionAvail().x;
-    const bool wide = avail >= 760.0f;
-    const float width = wide ? (avail - gap) * 0.5f : avail;
-
-    auto place = [&](bool first) {
-        if (!first && wide) {
-            ImGui::SameLine(0.0f, gap);
-        } else if (!first) {
-            ImGui::Spacing();
-        }
-    };
-
-    ImGui::BeginGroup();
-    ImGui::Dummy(ImVec2(width, 0.0f));
-    drawMetric("##st_m", tcGUICore::tr("主机器人", "Master"),
-        master ? master->statusText().c_str() : "—",
-        masterOn ? master->adsStateText().c_str() : gMasterEp.ip,
-        masterOn ? 1.0f : 0.0f, masterOn);
-    ImGui::EndGroup();
-    place(false);
-    drawMetric("##st_s", tcGUICore::tr("从机器人", "Slave"),
-        slave ? slave->statusText().c_str() : "—",
-        slaveOn ? slave->adsStateText().c_str() : gSlaveEp.ip,
-        slaveOn ? 1.0f : 0.0f, slaveOn);
-
-    ImGui::Spacing();
-    tcGUICore::dash::beginCard("##trend", ImVec2(0.0f, 250.0f));
-    tcGUICore::dash::caption(tcGUICore::tr("链路活动", "Link activity"));
-    tcGUICore::dash::title(masterOn && slaveOn
-            ? tcGUICore::tr("双机在线", "Both online")
-            : (masterOn || slaveOn ? tcGUICore::tr("部分在线", "Partial") : tcGUICore::tr("未连接", "Offline")),
-        22.0f);
-    ImGui::Spacing();
-    if (tcGUICore::dash::chip(tcGUICore::tr("主站", "Master"), masterOn, tcGUICore::dash::Accent::Blue)) {
-    }
-    ImGui::SameLine();
-    tcGUICore::dash::chip(tcGUICore::tr("从站", "Slave"), slaveOn, tcGUICore::dash::Accent::Cyan);
-    ImGui::SameLine();
-    tcGUICore::dash::chip(tcGUICore::tr("运动", "Motion"), gMasterSetup.enable || gSlaveSetup.enable, tcGUICore::dash::Accent::Green);
-    ImGui::Spacing();
-    tcGUICore::dash::sparkline(gLinkHistory, gLinkCount, ImVec2(ImGui::GetContentRegionAvail().x, 110.0f));
-    tcGUICore::dash::endCard();
-}
-
-void drawModeChips(const char* id, RobotSetup& setup)
-{
-    const char* modes[] = {
-        tcGUICore::tr("手动", "Manual"),
-        tcGUICore::tr("自动", "Auto"),
-        tcGUICore::tr("维护", "Service"),
-    };
-    const tcGUICore::dash::Accent accents[] = {
-        tcGUICore::dash::Accent::Blue,
-        tcGUICore::dash::Accent::Green,
-        tcGUICore::dash::Accent::Amber,
-    };
-    for (int i = 0; i < 3; ++i) {
-        ImGui::PushID(id);
-        ImGui::PushID(i);
-        if (tcGUICore::dash::chip(modes[i], setup.mode == i, accents[i])) {
-            setup.mode = i;
-        }
-        ImGui::PopID();
-        ImGui::PopID();
-        if (i < 2) {
-            ImGui::SameLine();
-        }
+    if (gLastPlcTry < 0.0 || now - gLastPlcTry >= kPlcRetrySec) {
+        gLastPlcTry = now;
+        tryConnectMaster();
     }
 }
 
-void drawRobotConfig(const char* id, const char* title, RobotSetup& setup, const Endpoint& ep, const char* plcId)
+ImU32 pack(const ImVec4& c)
 {
-    const bool on = linked(plcId);
-    const char* modes[] = {
-        tcGUICore::tr("手动", "Manual"),
-        tcGUICore::tr("自动", "Auto"),
-        tcGUICore::tr("维护", "Service"),
-    };
-    const int mode = setup.mode >= 0 && setup.mode < 3 ? setup.mode : 0;
-    const float gap = 16.0f;
-    const float avail = ImGui::GetContentRegionAvail().x;
-    const bool wide = avail >= 860.0f;
-    const float formWidth = wide ? avail * 0.62f : avail;
-
-    ImGui::BeginGroup();
-    tcGUICore::dash::beginCard(id, ImVec2(formWidth, 0.0f));
-    tcGUICore::dash::caption(on ? "ONLINE" : "OFFLINE");
-    ImGui::SameLine();
-    tcGUICore::dash::led(on);
-    tcGUICore::dash::title(title, 26.0f);
-    tcGUICore::dash::hint((std::string(ep.ip) + ":" + std::to_string(ep.port)).c_str());
-    ImGui::Spacing();
-    tcGUICore::dash::caption(tcGUICore::tr("工作模式", "Mode"));
-    drawModeChips(id, setup);
-    ImGui::Spacing();
-    char speedText[32];
-    std::snprintf(speedText, sizeof(speedText), "%.0f%%", setup.speed);
-    tcGUICore::dash::caption(tcGUICore::tr("速度上限", "Speed limit"));
-    tcGUICore::dash::title(speedText, 28.0f);
-    ImGui::SetNextItemWidth(-1.0f);
-    tcGUICore::dash::slider((std::string("##spd") + id).c_str(), &setup.speed, 1.0f, 100.0f);
-    ImGui::Spacing();
-    tcGUICore::dash::caption(tcGUICore::tr("工具名", "Tool"));
-    ImGui::SetNextItemWidth(-1.0f);
-    tcGUICore::dash::textField((std::string("##tool") + id).c_str(), setup.tool, sizeof(setup.tool));
-    ImGui::Spacing();
-    tcGUICore::dash::toggleRow((std::string("##en") + id).c_str(), tcGUICore::tr("允许运动", "Enable motion"), &setup.enable);
-    ImGui::Spacing();
-    tcGUICore::dash::hint(tcGUICore::tr(
-        "这些是控制台本地配置。PLC 符号对齐后，再从这里下发。",
-        "Local console settings. They are sent after the PLC symbols are mapped."));
-    tcGUICore::dash::endCard();
-    ImGui::EndGroup();
-
-    if (!wide) {
-        return;
-    }
-    ImGui::SameLine(0.0f, gap);
-    tcGUICore::dash::beginCard((std::string(id) + "_sum").c_str(), ImVec2(0.0f, 280.0f));
-    tcGUICore::dash::caption(tcGUICore::tr("当前配置", "Current"));
-    tcGUICore::dash::title(modes[mode], 28.0f);
-    tcGUICore::dash::title(speedText, 36.0f);
-    tcGUICore::dash::progress(setup.speed / 100.0f);
-    ImGui::Spacing();
-    tcGUICore::dash::caption(setup.tool);
-    ImGui::Spacing();
-    tcGUICore::dash::led(setup.enable);
-    ImGui::SameLine();
-    tcGUICore::dash::hint(setup.enable ? tcGUICore::tr("运动已允许", "Motion enabled") : tcGUICore::tr("运动已锁", "Motion locked"));
-    tcGUICore::dash::endCard();
+    return ImGui::ColorConvertFloat4ToU32(c);
 }
 
-void drawGallery()
+void drawBoot()
 {
-    const double now = ImGui::GetTime();
-    for (int i = 0; i < IM_ARRAYSIZE(gGallery.wave); ++i) {
-        gGallery.wave[i] = 0.5f + 0.4f * std::sin(static_cast<float>(now) * 1.4f + i * 0.28f);
+    if (gBootStart < 0.0) {
+        gBootStart = ImGui::GetTime();
+        gLastPlcTry = -1.0;
     }
+    pollMasterLink();
 
-    tcGUICore::dash::hint(tcGUICore::tr(
-        "左侧图标进入本页。下面每个控件都可以点，用来看亮灭、按下和拖动。",
-        "Open this page from the left rail. Every control below can be clicked."));
-    ImGui::Spacing();
+    const double elapsed = ImGui::GetTime() - gBootStart;
+    const float progress = std::clamp(static_cast<float>(elapsed / kBootSeconds), 0.0f, 1.0f);
+    const bool done = progress >= 1.0f;
+    const bool plcOn = masterReady();
 
-    const float gap = 16.0f;
-    const float avail = ImGui::GetContentRegionAvail().x;
-    const bool wide = avail >= 820.0f;
-    const float col = wide ? (avail - gap) * 0.5f : avail;
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const auto& pal = tcGUICore::dash::palette();
 
-    ImGui::BeginGroup();
-    tcGUICore::dash::beginCard("##gal_led", ImVec2(col, 168.0f));
-    tcGUICore::dash::caption(tcGUICore::tr("指示灯", "LED"));
-    tcGUICore::dash::title(gGallery.ledOn ? tcGUICore::tr("亮", "On") : tcGUICore::tr("灭", "Off"), 26.0f);
-    tcGUICore::dash::led(true);
-    ImGui::SameLine();
-    tcGUICore::dash::hint(tcGUICore::tr("常亮，带绿色光晕", "Steady on, with a green halo"));
-    tcGUICore::dash::led(false);
-    ImGui::SameLine();
-    tcGUICore::dash::hint(tcGUICore::tr("熄灭，灰色圆点", "Off, gray dot"));
-    if (tcGUICore::dash::button(gGallery.ledOn ? tcGUICore::tr("熄灭示例灯", "Turn sample off")
-                                               : tcGUICore::tr("点亮示例灯", "Turn sample on"),
-            ImVec2(160.0f, 34.0f), false)) {
-        gGallery.ledOn = !gGallery.ledOn;
-    }
-    ImGui::SameLine();
-    tcGUICore::dash::led(gGallery.ledOn);
-    tcGUICore::dash::endCard();
-    ImGui::EndGroup();
-    if (wide) {
-        ImGui::SameLine(0.0f, gap);
-    } else {
-        ImGui::Spacing();
-    }
+    dl->AddRectFilled(origin, origin + avail, pack(pal.window));
 
-    tcGUICore::dash::beginCard("##gal_btn", ImVec2(wide ? 0.0f : col, 168.0f));
-    tcGUICore::dash::caption(tcGUICore::tr("按键", "Button"));
-    tcGUICore::dash::hint(tcGUICore::tr("主按键绿色，按下变深。次按键深色，悬停变亮。",
-        "Primary is green and darkens when pressed. Secondary is dark and brightens on hover."));
-    if (tcGUICore::dash::button(tcGUICore::tr("主按键", "Primary"), ImVec2(120.0f, 36.0f), true)) {
-        gGallery.primaryDown = !gGallery.primaryDown;
-    }
-    ImGui::SameLine();
-    if (tcGUICore::dash::button(tcGUICore::tr("次按键", "Secondary"), ImVec2(120.0f, 36.0f), false)) {
-        gGallery.secondaryDown = !gGallery.secondaryDown;
-    }
-    tcGUICore::dash::hint(gGallery.primaryDown
-            ? tcGUICore::tr("主按键已按下过", "Primary has been pressed")
-            : tcGUICore::tr("主按键尚未按下", "Primary not pressed yet"));
-    tcGUICore::dash::endCard();
+    const ImVec2 center(origin.x + avail.x * 0.5f, origin.y + avail.y * 0.42f);
+    const float t = static_cast<float>(ImGui::GetTime());
+    const float pulse = 0.5f + 0.5f * std::sin(t * 2.2f);
 
-    ImGui::Spacing();
-    ImGui::BeginGroup();
-    tcGUICore::dash::beginCard("##gal_sw", ImVec2(col, 210.0f));
-    tcGUICore::dash::caption(tcGUICore::tr("开关", "Switch"));
-    tcGUICore::dash::title(gGallery.toggleOn ? tcGUICore::tr("开", "On") : tcGUICore::tr("关", "Off"), 26.0f);
-    tcGUICore::dash::hint(tcGUICore::tr("圆点滑到右侧为开，轨道变绿。", "Knob slides right when on and the track turns green."));
-    tcGUICore::dash::toggle("##gal_toggle", &gGallery.toggleOn);
-    ImGui::Spacing();
-    tcGUICore::dash::toggleRow("##gal_row", tcGUICore::tr("允许运动", "Enable motion"), &gGallery.toggleOn);
-    tcGUICore::dash::endCard();
-    ImGui::EndGroup();
-    if (wide) {
-        ImGui::SameLine(0.0f, gap);
-    } else {
-        ImGui::Spacing();
-    }
-
-    tcGUICore::dash::beginCard("##gal_slider", ImVec2(wide ? 0.0f : col, 168.0f));
-    char speed[32];
-    std::snprintf(speed, sizeof(speed), "%.0f%%", gGallery.slider);
-    tcGUICore::dash::caption(tcGUICore::tr("下滑槽", "Slider"));
-    tcGUICore::dash::title(speed, 28.0f);
-    tcGUICore::dash::hint(tcGUICore::tr("拖动圆点改变数值，左侧填成绿色。", "Drag the knob. The track fills green from the left."));
-    ImGui::SetNextItemWidth(-1.0f);
-    tcGUICore::dash::slider("##gal_spd", &gGallery.slider, 0.0f, 100.0f);
-    tcGUICore::dash::endCard();
-
-    ImGui::Spacing();
-    tcGUICore::dash::beginCard("##gal_choice", ImVec2(0.0f, 230.0f));
-    tcGUICore::dash::caption(tcGUICore::tr("勾选、单选、数字、徽标", "Check, radio, number, badge"));
-    tcGUICore::dash::hint(tcGUICore::tr(
-        "勾选是方框对勾。单选是圆点，一组里只亮一个。数字框限制范围。徽标只显示状态，不能点。",
-        "Check is a box with a mark. Radio keeps one dot in a group. The number field stays in range. Badges only show status."));
-    tcGUICore::dash::check("##gal_check", tcGUICore::tr("记住登录", "Remember login"), &gGallery.checked);
-    ImGui::Spacing();
-    tcGUICore::dash::radio("##gal_r0", tcGUICore::tr("主站", "Master"), &gGallery.radio, 0);
-    ImGui::SameLine();
-    tcGUICore::dash::radio("##gal_r1", tcGUICore::tr("从站", "Slave"), &gGallery.radio, 1);
-    ImGui::Spacing();
-    tcGUICore::dash::caption(tcGUICore::tr("端口", "Port"));
-    ImGui::SetNextItemWidth(160.0f);
-    tcGUICore::dash::numberField("##gal_port", &gGallery.port, 1, 65535);
-    tcGUICore::dash::divider();
-    tcGUICore::dash::badge(tcGUICore::tr("在线", "Online"), tcGUICore::dash::Accent::Green);
-    ImGui::SameLine();
-    tcGUICore::dash::badge(tcGUICore::tr("连接中", "Connecting"), tcGUICore::dash::Accent::Amber);
-    ImGui::SameLine();
-    tcGUICore::dash::badge(tcGUICore::tr("故障", "Fault"), tcGUICore::dash::Accent::Violet);
-    tcGUICore::dash::endCard();
-
-    ImGui::Spacing();
-    tcGUICore::dash::beginCard("##gal_chip", ImVec2(0.0f, 150.0f));
-    tcGUICore::dash::caption(tcGUICore::tr("标签", "Chip"));
-    tcGUICore::dash::hint(tcGUICore::tr("选中时铺满对应颜色，未选中是深色胶囊。",
-        "Selected chips fill with their color. Unselected chips stay dark."));
-    const char* chips[] = {
-        tcGUICore::tr("手动", "Manual"),
-        tcGUICore::tr("自动", "Auto"),
-        tcGUICore::tr("维护", "Service"),
-        tcGUICore::tr("报警", "Alarm"),
-    };
-    const tcGUICore::dash::Accent accents[] = {
-        tcGUICore::dash::Accent::Blue,
-        tcGUICore::dash::Accent::Green,
-        tcGUICore::dash::Accent::Amber,
-        tcGUICore::dash::Accent::Violet,
-    };
     for (int i = 0; i < 4; ++i) {
-        if (tcGUICore::dash::chip(chips[i], gGallery.chip == i, accents[i])) {
-            gGallery.chip = i;
+        const float radius = 48.0f + i * 34.0f + pulse * 6.0f;
+        const float alpha = (0.18f - i * 0.035f) * (0.45f + progress * 0.55f);
+        ImVec4 ring = pal.blue;
+        if (i == 1) {
+            ring = pal.cyan;
+        } else if (i >= 2) {
+            ring = pal.green;
         }
-        if (i < 3) {
-            ImGui::SameLine();
-        }
+        ring.w = alpha;
+        dl->AddCircle(center, radius, pack(ring), 64, 2.0f + (i == 0 ? 1.2f : 0.0f));
     }
-    tcGUICore::dash::endCard();
 
-    ImGui::Spacing();
+    // 中心十字与弧线：手术机器人开机意象，不抢主文案。
+    const float arm = 22.0f + progress * 10.0f;
+    dl->AddCircleFilled(center, 10.0f, pack(ImVec4(pal.green.x, pal.green.y, pal.green.z, 0.35f + pulse * 0.25f)), 24);
+    dl->AddLine(center - ImVec2(arm, 0.0f), center + ImVec2(arm, 0.0f), pack(pal.text), 2.0f);
+    dl->AddLine(center - ImVec2(0.0f, arm), center + ImVec2(0.0f, arm), pack(pal.text), 2.0f);
+    dl->PathClear();
+    dl->PathArcTo(center, 38.0f, t * 1.6f, t * 1.6f + 2.2f, 32);
+    dl->PathStroke(pack(ImVec4(pal.cyan.x, pal.cyan.y, pal.cyan.z, 0.75f)), 0, 2.4f);
+
+    ImGui::SetCursorScreenPos(ImVec2(origin.x, center.y + 96.0f));
+    ImGui::PushItemWidth(avail.x);
     ImGui::BeginGroup();
-    tcGUICore::dash::beginCard("##gal_field", ImVec2(col, 230.0f));
-    tcGUICore::dash::caption(tcGUICore::tr("输入与下拉", "Field and combo"));
-    tcGUICore::dash::hint(tcGUICore::tr("圆角深色输入框。下拉打开后当前项用绿色高亮。",
-        "Rounded dark field. The open list highlights the current item in green."));
-    ImGui::SetNextItemWidth(-1.0f);
-    tcGUICore::dash::textField("##gal_text", gGallery.text, sizeof(gGallery.text));
-    const char* tools[] = {"Tool-A", "Tool-B", "Tool-C"};
-    ImGui::SetNextItemWidth(-1.0f);
-    tcGUICore::dash::combo("##gal_combo", &gGallery.combo, tools, IM_ARRAYSIZE(tools));
-    tcGUICore::dash::endCard();
+    {
+        const char* brand = "Surgeon Console";
+        ImGui::PushFont(ImGui::GetFont(), 28.0f);
+        const ImVec2 brandSize = ImGui::CalcTextSize(brand);
+        ImGui::SetCursorPosX((avail.x - brandSize.x) * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_Text, pal.text);
+        ImGui::TextUnformatted(brand);
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+    }
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    {
+        const char* line = tcGUICore::tr("灵窥手术机器人 · 医生控制台", "Lingkui Surgical Robot · Surgeon console");
+        const ImVec2 lineSize = ImGui::CalcTextSize(line);
+        ImGui::SetCursorPosX(std::max(0.0f, (avail.x - lineSize.x) * 0.5f));
+        tcGUICore::dash::hint(line);
+    }
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+
+    const float barW = std::min(420.0f, avail.x * 0.55f);
+    ImGui::SetCursorPosX((avail.x - barW) * 0.5f);
+    ImGui::BeginChild("##boot_bar", ImVec2(barW, 64.0f), ImGuiChildFlags_None);
+    tcGUICore::dash::progress(progress);
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    tcGUICore::dash::led(plcOn);
+    ImGui::SameLine();
+    tcGUICore::dash::hint(plcOn
+            ? tcGUICore::tr("Control Core 已就绪", "Control Core ready")
+            : (connecting(kMasterId)
+                    ? tcGUICore::tr("正在连接 Control Core…", "Connecting Control Core…")
+                    : tcGUICore::tr("等待 Control Core…", "Waiting for Control Core…")));
+    ImGui::EndChild();
     ImGui::EndGroup();
-    if (wide) {
-        ImGui::SameLine(0.0f, gap);
-    } else {
-        ImGui::Spacing();
-    }
+    ImGui::PopItemWidth();
 
-    tcGUICore::dash::beginCard("##gal_icon", ImVec2(wide ? 0.0f : col, 230.0f));
-    tcGUICore::dash::caption(tcGUICore::tr("图标按键", "Icon button"));
-    tcGUICore::dash::hint(tcGUICore::tr("未选中是深色方块，选中铺绿底。悬停会略微变亮。",
-        "Idle buttons are dark squares. The selected one turns green. Hover lightens them."));
-    tcGUICore::dash::iconButton("##gal_i0", tcGUICore::dash::iconPlug, gGallery.iconOn);
-    ImGui::SameLine();
-    tcGUICore::dash::iconButton("##gal_i1", tcGUICore::dash::iconPulse, !gGallery.iconOn);
-    ImGui::SameLine();
-    tcGUICore::dash::iconButton("##gal_i2", tcGUICore::dash::iconArm, false);
-    ImGui::SameLine();
-    tcGUICore::dash::iconButton("##gal_i3", tcGUICore::dash::iconPower, false);
-    if (tcGUICore::dash::button(tcGUICore::tr("切换选中", "Toggle selected"), ImVec2(140.0f, 34.0f), true)) {
-        gGallery.iconOn = !gGallery.iconOn;
-    }
-    tcGUICore::dash::endCard();
+    ImGui::SetCursorScreenPos(origin);
+    ImGui::Dummy(avail);
 
-    ImGui::Spacing();
-    tcGUICore::dash::beginCard("##gal_bar", ImVec2(0.0f, 220.0f));
-    tcGUICore::dash::caption(tcGUICore::tr("进度条与折线", "Progress and sparkline"));
-    tcGUICore::dash::hint(tcGUICore::tr("上条跟随滑槽。中条表示连接中。下图是随时间起伏的示例曲线。",
-        "Top bar follows the slider. Middle bar is the connecting animation. The plot is a live sample wave."));
-    tcGUICore::dash::progress(gGallery.slider / 100.0f);
-    ImGui::Spacing();
-    tcGUICore::dash::progress(-1.0f);
-    ImGui::Spacing();
-    tcGUICore::dash::sparkline(gGallery.wave, IM_ARRAYSIZE(gGallery.wave), ImVec2(ImGui::GetContentRegionAvail().x, 110.0f));
-    tcGUICore::dash::endCard();
-    ImGui::Dummy(ImVec2(0.0f, 12.0f));
+    if (done) {
+        gPhase = Phase::Login;
+    }
 }
 
 void drawLogin()
 {
+    pollMasterLink();
+    const bool plcOn = masterReady();
+    const bool busy = connecting(kMasterId);
+    tcGUICore::PlcClient* plc = clientOf(kMasterId);
+    const auto& pal = tcGUICore::dash::palette();
+
+    // 首次进入：用 JSON 里的 Control Core 地址初始化编辑框。
+    if (plc && gMasterEp.ip[0] != '\0') {
+        static bool seeded = false;
+        if (!seeded) {
+            const auto cfg = plc->config();
+            if (!cfg.ip.empty()) {
+                std::snprintf(gMasterEp.ip, sizeof(gMasterEp.ip), "%s", cfg.ip.c_str());
+            }
+            if (cfg.adsPort > 0) {
+                gMasterEp.port = static_cast<int>(cfg.adsPort);
+            }
+            seeded = true;
+        }
+    }
+
+    // 标题栏下方剩余区域：用屏幕坐标居中，避免 SetCursorPos 相对窗口顶导致偏上。
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
-    const ImVec2 card(420.0f, 390.0f);
-    ImGui::SetCursorPos(ImVec2((avail.x - card.x) * 0.5f, (avail.y - card.y) * 0.32f));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(origin, origin + avail, pack(pal.window));
+
+    const ImVec2 card(440.0f, plcOn ? 460.0f : 560.0f);
+    const float padX = std::max(0.0f, (avail.x - card.x) * 0.5f);
+    const float padY = std::max(0.0f, (avail.y - card.y) * 0.5f);
+    ImGui::SetCursorScreenPos(origin + ImVec2(padX, padY));
+
     tcGUICore::dash::beginCard("##login", card);
-    tcGUICore::dash::title("Robot Console", 28.0f);
-    tcGUICore::dash::hint(tcGUICore::tr("主从机器人控制台", "Master / slave console"));
+    tcGUICore::dash::title("Surgeon Console", 28.0f);
+    tcGUICore::dash::hint(tcGUICore::tr("医生控制台登录", "Surgeon console sign-in"));
     ImGui::Spacing();
+
+    ImGui::BeginGroup();
+    tcGUICore::dash::led(plcOn);
+    ImGui::SameLine();
+    if (plcOn) {
+        tcGUICore::dash::badge("Control Core", tcGUICore::dash::Accent::Green);
+    } else if (busy) {
+        tcGUICore::dash::badge(tcGUICore::tr("连接中", "Connecting"), tcGUICore::dash::Accent::Amber);
+    } else {
+        tcGUICore::dash::badge(tcGUICore::tr("等待 Control Core", "Waiting Control Core"), tcGUICore::dash::Accent::Amber);
+    }
+    ImGui::EndGroup();
+    ImGui::Spacing();
+    tcGUICore::dash::hint(plcOn
+            ? tcGUICore::tr("Control Core 已连接，可以登录。", "Control Core linked. You may sign in.")
+            : tcGUICore::tr("正在等待 Control Core 并自动重试连接…",
+                "Waiting for Control Core; auto-retrying connection…"));
+    if (!plcOn && plc) {
+        const std::string detail = plc->lastError().empty() ? plc->statusText() : plc->lastError();
+        if (!detail.empty() && detail != "—") {
+            ImGui::PushStyleColor(ImGuiCol_Text, pal.muted);
+            ImGui::TextWrapped("%s", detail.c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::Spacing();
+        tcGUICore::dash::caption("IP");
+        ImGui::SetNextItemWidth(-1.0f);
+        if (tcGUICore::dash::textField("##login_ip", gMasterEp.ip, sizeof(gMasterEp.ip))) {
+            gLastPlcTry = -1.0;
+        }
+        tcGUICore::dash::caption(tcGUICore::tr("端口", "Port"));
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, pal.field);
+        ImGui::PushStyleColor(ImGuiCol_Text, pal.text);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
+        if (ImGui::InputInt("##login_port", &gMasterEp.port)) {
+            gLastPlcTry = -1.0;
+        }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+        if (gMasterEp.port < 1) {
+            gMasterEp.port = 851;
+        }
+        ImGui::Spacing();
+        if (tcGUICore::dash::button(tcGUICore::tr("重试连接", "Retry link"), ImVec2(-1.0f, 36.0f), false) &&
+            !busy) {
+            gLastPlcTry = -1.0;
+            tryConnectMaster();
+        }
+    }
+    ImGui::Spacing();
+
+    // 等 Control Core 时可先填账号；仅登录键受门控。
     tcGUICore::dash::caption(tcGUICore::tr("用户", "User"));
     ImGui::SetNextItemWidth(-1.0f);
     tcGUICore::dash::textField("##user", gLogin.user, sizeof(gLogin.user));
@@ -532,19 +410,371 @@ void drawLogin()
     const bool enter = tcGUICore::dash::textField("##pass", gLogin.password, sizeof(gLogin.password),
         ImGuiInputTextFlags_Password | ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::Spacing();
+
     auto submit = [&] {
+        if (!plcOn) {
+            return;
+        }
         gLogin.failed = std::strcmp(gLogin.user, "admin") != 0 || std::strcmp(gLogin.password, "admin") != 0;
         gAuthed = !gLogin.failed;
+        if (gAuthed) {
+            gPhase = Phase::Home;
+            gHomePage = HomePage::Instruments;
+        }
     };
-    if (tcGUICore::dash::button(tcGUICore::tr("登录", "Sign in"), ImVec2(-1.0f, 42.0f), true) || enter) {
+
+    ImGui::BeginDisabled(!plcOn);
+    const bool clicked = tcGUICore::dash::button(tcGUICore::tr("登录", "Sign in"), ImVec2(-1.0f, 44.0f), true);
+    ImGui::EndDisabled();
+    if (plcOn && (clicked || enter)) {
         submit();
     }
+
+    if (!plcOn) {
+        ImGui::Spacing();
+        tcGUICore::dash::progress(-1.0f);
+    }
     if (gLogin.failed) {
-        ImGui::PushStyleColor(ImGuiCol_Text, tcGUICore::dash::palette().danger);
+        ImGui::PushStyleColor(ImGuiCol_Text, pal.danger);
         ImGui::TextUnformatted(tcGUICore::tr("用户名或密码错误", "Invalid user or password"));
         ImGui::PopStyleColor();
     }
     tcGUICore::dash::hint(tcGUICore::tr("演示账号 admin / admin", "Demo account admin / admin"));
+    tcGUICore::dash::endCard();
+}
+
+float gVolume = 0.55f;
+bool gVolumeOpen = false;
+
+// 状态行 + 安装/拆卸按键；点击且允许时返回 true。
+bool drawStatusRow(const char* toggleId, const char* label, bool on,
+    const char* onText, const char* offText, bool actionEnabled)
+{
+    const float rowStartX = ImGui::GetCursorPosX();
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float btnW = 72.0f;
+    const float btnH = 28.0f;
+
+    tcGUICore::dash::led(on);
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    tcGUICore::dash::caption(label);
+    ImGui::PushStyleColor(ImGuiCol_Text, on ? tcGUICore::dash::palette().text : tcGUICore::dash::palette().muted);
+    ImGui::TextUnformatted(on ? onText : offText);
+    ImGui::PopStyleColor();
+    ImGui::EndGroup();
+
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(rowStartX + std::max(0.0f, availW - btnW));
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 2.0f);
+    const char* action = on ? tcGUICore::tr("拆卸", "Remove") : tcGUICore::tr("安装", "Install");
+    ImGui::PushID(toggleId);
+    ImGui::BeginDisabled(!actionEnabled);
+    const bool pressed = tcGUICore::dash::button(action, ImVec2(btnW, btnH), !on && actionEnabled);
+    ImGui::EndDisabled();
+    ImGui::PopID();
+    return pressed && actionEnabled;
+}
+
+void drawToolCard(const char* id, const char* role, int bayIndex, ToolSlot& slot, const ImVec2& size,
+    tcGUICore::dash::Accent accent)
+{
+    enforceToolRules(slot);
+    const auto& pal = tcGUICore::dash::palette();
+    const ImU32 accentCol = tcGUICore::dash::colorOf(accent);
+    ImVec4 accentVec = ImGui::ColorConvertU32ToFloat4(accentCol);
+
+    // 目标高度：未装=0，仅隔离板=1/6，器械安装=满槽。
+    const float targetFill = slot.toolPresent ? 1.0f : (slot.isolatorPresent ? (1.0f / 6.0f) : 0.0f);
+    const float dt = ImGui::GetIO().DeltaTime;
+    const float ease = 1.0f - std::exp(-10.0f * std::max(dt, 0.0f));
+    gBayFillAnim[bayIndex] += (targetFill - gBayFillAnim[bayIndex]) * ease;
+    if (std::fabs(gBayFillAnim[bayIndex] - targetFill) < 0.001f) {
+        gBayFillAnim[bayIndex] = targetFill;
+    }
+    const float fill = gBayFillAnim[bayIndex];
+    // 色块已半透明，文字保持浅色即可。
+    const bool textOnFill = false;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, pal.card);
+    ImGui::PushStyleColor(ImGuiCol_Border, pal.cardBorder);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 18.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.0f, 18.0f));
+    ImGui::BeginChild(id, size, ImGuiChildFlags_Borders);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 win = ImGui::GetWindowPos();
+    const ImVec2 winSize = ImGui::GetWindowSize();
+    const float round = 18.0f;
+
+    // 自下而上弹出的主题色块：倒角与器械槽一致，并带透明度。
+    if (fill > 0.001f) {
+        const float blockH = winSize.y * fill;
+        const ImVec2 p0(win.x, win.y + winSize.y - blockH);
+        const ImVec2 p1(win.x + winSize.x, win.y + winSize.y);
+        ImVec4 blockCol = accentVec;
+        blockCol.w = slot.toolPresent || fill > 0.9f ? 0.42f : 0.36f;
+        const float r = std::min(round, blockH * 0.5f);
+        dl->AddRectFilled(p0, p1, pack(blockCol), r);
+    }
+
+    if (textOnFill) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.06f, 0.08f, 0.10f, 0.78f));
+        ImGui::TextUnformatted(role);
+        ImGui::PopStyleColor();
+    } else {
+        tcGUICore::dash::caption(role);
+    }
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+
+    const std::string type = tcGUICore::displayNameText(slot.typeName);
+    if (slot.toolPresent && !type.empty()) {
+        if (textOnFill) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.05f, 0.07f, 0.09f, 1.0f));
+            ImGui::PushFont(ImGui::GetFont(), 30.0f);
+            ImGui::TextUnformatted(type.c_str());
+            ImGui::PopFont();
+            ImGui::PopStyleColor();
+        } else {
+            tcGUICore::dash::title(type.c_str(), 30.0f);
+        }
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, textOnFill
+                ? ImVec4(0.06f, 0.08f, 0.10f, 0.55f)
+                : pal.muted);
+        ImGui::PushFont(ImGui::GetFont(), 30.0f);
+        ImGui::TextUnformatted("—");
+        ImGui::PopFont();
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Dummy(ImVec2(0.0f, 20.0f));
+    char toolToggleId[32];
+    char isoToggleId[32];
+    std::snprintf(toolToggleId, sizeof(toolToggleId), "tool_tog_%d", bayIndex);
+    std::snprintf(isoToggleId, sizeof(isoToggleId), "iso_tog_%d", bayIndex);
+
+    // 安装顺序：隔离板 → 器械；拆卸顺序：器械 → 隔离板。
+    const bool canInstallTool = slot.isolatorPresent;
+    const bool canRemoveIsolator = !slot.toolPresent;
+    const bool toolActionOk = slot.toolPresent ? true : canInstallTool;
+    const bool isoActionOk = slot.isolatorPresent ? canRemoveIsolator : true;
+
+    if (drawStatusRow(
+            toolToggleId,
+            tcGUICore::tr("器械", "Instrument"),
+            slot.toolPresent,
+            tcGUICore::tr("已安装", "Installed"),
+            tcGUICore::tr("未安装", "Not installed"),
+            toolActionOk)) {
+        applyToolPresent(bayIndex, !slot.toolPresent);
+    }
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    if (drawStatusRow(
+            isoToggleId,
+            tcGUICore::tr("隔离板", "Isolator"),
+            slot.isolatorPresent,
+            tcGUICore::tr("已安装", "Installed"),
+            tcGUICore::tr("未安装", "Not installed"),
+            isoActionOk)) {
+        applyIsolatorPresent(bayIndex, !slot.isolatorPresent);
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+}
+
+void drawMsLockOverlay()
+{
+    if (!msScreenLocked()) {
+        return;
+    }
+
+    const ImVec2 origin = ImGui::GetWindowPos();
+    const ImVec2 size = ImGui::GetWindowSize();
+
+    ImGui::SetCursorScreenPos(origin);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.024f, 0.031f, 0.047f, 0.88f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::BeginChild("##ms_lock_layer", size, ImGuiChildFlags_None,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    const ImVec2 panel(400.0f, 200.0f);
+    ImGui::SetCursorPos(ImVec2((size.x - panel.x) * 0.5f, (size.y - panel.y) * 0.5f));
+    tcGUICore::dash::beginCard("##ms_lock_card", panel);
+    tcGUICore::dash::caption(tcGUICore::tr("主从状态", "Master-Slave"));
+    tcGUICore::dash::title(tcGUICore::tr("屏幕已锁定", "Screen locked"), 26.0f);
+    tcGUICore::dash::hint(tcGUICore::tr("确认安全可解锁", "Confirm safe to unlock"));
+    ImGui::Spacing();
+    if (tcGUICore::dash::button(tcGUICore::tr("解锁", "Unlock"), ImVec2(-1.0f, 44.0f), true)) {
+        requestUserUnlock();
+    }
+    tcGUICore::dash::endCard();
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
+
+void drawVolumeStrip(const ImVec2& size)
+{
+    const auto& pal = tcGUICore::dash::palette();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.11f, 0.13f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Border, pal.cardBorder);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 16.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 12.0f));
+    ImGui::BeginChild("##volume_strip", size, ImGuiChildFlags_Borders);
+
+    const float rowH = ImGui::GetContentRegionAvail().y;
+    const float btn = std::min(48.0f, rowH);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (rowH - btn) * 0.5f);
+
+    const ImVec2 btnPos = ImGui::GetCursorScreenPos();
+    if (ImGui::InvisibleButton("##volume_btn", ImVec2(btn, btn))) {
+        gVolumeOpen = !gVolumeOpen;
+    }
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 c = btnPos + ImVec2(btn * 0.5f, btn * 0.5f);
+        const ImU32 col = pack(gVolumeOpen ? pal.cyan : pal.muted);
+        const ImU32 bg = pack(gVolumeOpen ? ImVec4(pal.cyan.x, pal.cyan.y, pal.cyan.z, 0.18f) : pal.field);
+        dl->AddRectFilled(btnPos, btnPos + ImVec2(btn, btn), bg, 14.0f);
+        dl->AddRectFilled(c + ImVec2(-12.0f, -5.0f), c + ImVec2(-4.0f, 5.0f), col, 2.0f);
+        dl->AddTriangleFilled(c + ImVec2(-6.0f, -8.0f), c + ImVec2(-6.0f, 8.0f), c + ImVec2(6.0f, 0.0f), col);
+        dl->PathClear();
+        dl->PathArcTo(c + ImVec2(4.0f, 0.0f), 9.0f, -0.85f, 0.85f, 12);
+        dl->PathStroke(col, 0, 2.0f);
+        if (gVolumeOpen) {
+            dl->PathClear();
+            dl->PathArcTo(c + ImVec2(4.0f, 0.0f), 14.0f, -0.85f, 0.85f, 12);
+            dl->PathStroke(col, 0, 1.6f);
+        }
+    }
+
+    ImGui::SameLine(0.0f, 14.0f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (btn - ImGui::GetFrameHeight()) * 0.5f);
+
+    if (gVolumeOpen) {
+        const float barW = std::max(180.0f, ImGui::GetContentRegionAvail().x - 80.0f);
+        ImGui::SetNextItemWidth(barW);
+        tcGUICore::dash::slider("##volume", &gVolume, 0.0f, 1.0f);
+        ImGui::SameLine(0.0f, 12.0f);
+        ImGui::AlignTextToFramePadding();
+        char level[32];
+        std::snprintf(level, sizeof(level), "%d%%", static_cast<int>(gVolume * 100.0f + 0.5f));
+        ImGui::TextUnformatted(level);
+    } else {
+        ImGui::AlignTextToFramePadding();
+        tcGUICore::dash::caption(tcGUICore::tr("点击声音键调节音量", "Tap sound to adjust volume"));
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+}
+
+void drawInstrumentsPage()
+{
+    syncToolsFromPlc();
+
+    const auto& pal = tcGUICore::dash::palette();
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddRectFilled(origin, origin + avail, pack(pal.window), 12.0f);
+
+    const float gap = 18.0f;
+    const float bottomH = avail.y * 0.25f;
+    const float cardH = std::max(180.0f, avail.y - bottomH - gap);
+    const float width = (avail.x - gap * 2.0f) / 3.0f;
+    const ImVec2 cardSize(width, cardH);
+
+    drawToolCard("##tool_l", tcGUICore::tr("左器械滚筒", "Left tool roller"),
+        0, gTools[0], cardSize, tcGUICore::dash::Accent::Blue);
+    ImGui::SameLine(0.0f, gap);
+    drawToolCard("##tool_e", tcGUICore::tr("内镜滚筒", "Endoscope roller"),
+        1, gTools[1], cardSize, tcGUICore::dash::Accent::Violet);
+    ImGui::SameLine(0.0f, gap);
+    drawToolCard("##tool_r", tcGUICore::tr("右器械滚筒", "Right tool roller"),
+        2, gTools[2], cardSize, tcGUICore::dash::Accent::Cyan);
+
+    ImGui::Dummy(ImVec2(0.0f, gap));
+    drawVolumeStrip(ImVec2(avail.x, std::max(64.0f, bottomH - gap)));
+}
+
+void drawPlcPage()
+{
+    tcGUICore::PlcClient* plc = clientOf(kMasterId);
+    const bool on = masterReady();
+    const bool busy = connecting(kMasterId);
+    tcGUICore::dash::beginCard("##plc_master", ImVec2(0.0f, 300.0f));
+    tcGUICore::dash::caption("MASTER");
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 36.0f);
+    tcGUICore::dash::led(on);
+    tcGUICore::dash::title("Control Core", 24.0f);
+    ImGui::Spacing();
+    tcGUICore::dash::caption("IP");
+    ImGui::SetNextItemWidth(-1.0f);
+    tcGUICore::dash::textField("##mip", gMasterEp.ip, sizeof(gMasterEp.ip));
+    tcGUICore::dash::caption(tcGUICore::tr("端口", "Port"));
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, tcGUICore::dash::palette().field);
+    ImGui::PushStyleColor(ImGuiCol_Text, tcGUICore::dash::palette().text);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
+    ImGui::InputInt("##mport", &gMasterEp.port);
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+    if (gMasterEp.port < 1) {
+        gMasterEp.port = 851;
+    }
+    ImGui::Spacing();
+    tcGUICore::dash::progress(busy ? -1.0f : (on ? 1.0f : 0.0f));
+    ImGui::Spacing();
+    if (tcGUICore::dash::button(on ? tcGUICore::tr("断开", "Disconnect") : tcGUICore::tr("连接", "Connect"),
+            ImVec2(148.0f, 38.0f), !on) &&
+        !busy) {
+        if (on) {
+            plc->disconnect();
+        } else {
+            gLastPlcTry = -1.0;
+            tryConnectMaster();
+        }
+    }
+    ImGui::SameLine();
+    if (plc) {
+        tcGUICore::dash::hint(on ? plc->adsStateText().c_str() : plc->statusText().c_str());
+    }
+    tcGUICore::dash::endCard();
+}
+
+void drawStatusPage()
+{
+    syncToolsFromPlc();
+    tcGUICore::PlcClient* plc = clientOf(kMasterId);
+    const bool on = masterReady();
+    for (ToolSlot& slot : gTools) {
+        enforceToolRules(slot);
+    }
+    tcGUICore::dash::beginCard("##status", ImVec2(0.0f, 260.0f));
+    tcGUICore::dash::caption(tcGUICore::tr("系统状态", "System status"));
+    tcGUICore::dash::title(on ? tcGUICore::tr("Control Core 在线", "Control Core online")
+                              : tcGUICore::tr("Control Core 离线", "Control Core offline"), 26.0f);
+    tcGUICore::dash::progress(on ? 1.0f : 0.0f);
+    ImGui::Spacing();
+    tcGUICore::dash::hint(plc ? plc->statusText().c_str() : "—");
+    ImGui::Spacing();
+    tcGUICore::dash::chip(tcGUICore::tr("左·夹钳", "L·Clamp"), gTools[0].toolPresent, tcGUICore::dash::Accent::Blue);
+    ImGui::SameLine();
+    tcGUICore::dash::chip(tcGUICore::tr("中·内镜", "C·Scope"), gTools[1].toolPresent, tcGUICore::dash::Accent::Violet);
+    ImGui::SameLine();
+    tcGUICore::dash::chip(tcGUICore::tr("右·电刀", "R·Energy"), gTools[2].toolPresent, tcGUICore::dash::Accent::Cyan);
+    ImGui::Spacing();
+    tcGUICore::dash::chip(tcGUICore::tr("左隔离板", "L isolator"), gTools[0].isolatorPresent, tcGUICore::dash::Accent::Green);
+    ImGui::SameLine();
+    tcGUICore::dash::chip(tcGUICore::tr("镜隔离板", "Scope isolator"), gTools[1].isolatorPresent, tcGUICore::dash::Accent::Green);
+    ImGui::SameLine();
+    tcGUICore::dash::chip(tcGUICore::tr("右隔离板", "R isolator"), gTools[2].isolatorPresent, tcGUICore::dash::Accent::Green);
     tcGUICore::dash::endCard();
 }
 
@@ -554,29 +784,22 @@ void drawRail()
     ImGui::BeginChild("##rail", ImVec2(76.0f, 0.0f));
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     ImGui::SetCursorPosX(16.0f);
-    if (tcGUICore::dash::iconButton("##nav_gal", tcGUICore::dash::iconTiles, gPage == Page::Gallery)) {
-        gPage = Page::Gallery;
+    if (tcGUICore::dash::iconButton("##nav_tools", tcGUICore::dash::iconTiles, gHomePage == HomePage::Instruments)) {
+        gHomePage = HomePage::Instruments;
     }
     ImGui::SetCursorPosX(16.0f);
-    if (tcGUICore::dash::iconButton("##nav_plc", tcGUICore::dash::iconPlug, gPage == Page::Plc)) {
-        gPage = Page::Plc;
+    if (tcGUICore::dash::iconButton("##nav_plc", tcGUICore::dash::iconPlug, gHomePage == HomePage::Plc)) {
+        gHomePage = HomePage::Plc;
     }
     ImGui::SetCursorPosX(16.0f);
-    if (tcGUICore::dash::iconButton("##nav_st", tcGUICore::dash::iconPulse, gPage == Page::Status)) {
-        gPage = Page::Status;
-    }
-    ImGui::SetCursorPosX(16.0f);
-    if (tcGUICore::dash::iconButton("##nav_m", tcGUICore::dash::iconArm, gPage == Page::Master)) {
-        gPage = Page::Master;
-    }
-    ImGui::SetCursorPosX(16.0f);
-    if (tcGUICore::dash::iconButton("##nav_s", tcGUICore::dash::iconArmPair, gPage == Page::Slave)) {
-        gPage = Page::Slave;
+    if (tcGUICore::dash::iconButton("##nav_st", tcGUICore::dash::iconPulse, gHomePage == HomePage::Status)) {
+        gHomePage = HomePage::Status;
     }
     ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 64.0f);
     ImGui::SetCursorPosX(16.0f);
     if (tcGUICore::dash::iconButton("##logout", tcGUICore::dash::iconPower, false)) {
         gAuthed = false;
+        gPhase = Phase::Login;
         gLogin.password[0] = '\0';
         gLogin.failed = false;
     }
@@ -586,42 +809,62 @@ void drawRail()
 
 void drawHeader()
 {
-    const bool masterOn = linked(kMasterId);
-    const bool slaveOn = linked(kSlaveId);
+    const bool plcOn = masterReady();
+    const float rowH = 32.0f;
+
+    // 左：主标题
     ImGui::BeginGroup();
-    tcGUICore::dash::title("Robot Console", 22.0f);
-    const char* sub = tcGUICore::tr("控件一览", "Widget gallery");
-    if (gPage == Page::Plc) {
-        sub = tcGUICore::tr("PLC 连接", "PLC link");
-    } else if (gPage == Page::Status) {
+    ImGui::AlignTextToFramePadding();
+    tcGUICore::dash::title("Main Page", 22.0f);
+    const char* sub = tcGUICore::tr("器械舱", "Instrument bay");
+    if (gHomePage == HomePage::Plc) {
+        sub = tcGUICore::tr("Control Core 连接", "Control Core link");
+    } else if (gHomePage == HomePage::Status) {
         sub = tcGUICore::tr("系统状态", "System status");
-    } else if (gPage == Page::Master) {
-        sub = tcGUICore::tr("主机器人配置", "Master setup");
-    } else if (gPage == Page::Slave) {
-        sub = tcGUICore::tr("从机器人配置", "Slave setup");
     }
     tcGUICore::dash::hint(sub);
     ImGui::EndGroup();
+
+    // 右：灯 / Control Core / 语言 —— 同一行垂直居中对齐
+    const char* ctrl = "Control Core";
+    const char* langLabel = tcGUICore::currentLanguage() == tcGUICore::Language::Zh ? "中文" : "EN";
+    const float langW = 72.0f;
+    const float rightW = 14.0f + 8.0f + ImGui::CalcTextSize(ctrl).x + 16.0f + langW;
     ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 250.0f);
-    tcGUICore::dash::led(masterOn);
+    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX() + 16.0f, ImGui::GetWindowWidth() - rightW - 8.0f));
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);
+
+    ImGui::BeginGroup();
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 0.0f));
+    ImGui::AlignTextToFramePadding();
+    tcGUICore::dash::led(plcOn, 6.0f);
     ImGui::SameLine();
-    tcGUICore::dash::caption(tcGUICore::tr("主站", "Master"));
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushStyleColor(ImGuiCol_Text, tcGUICore::dash::palette().muted);
+    ImGui::TextUnformatted(ctrl);
+    ImGui::PopStyleColor();
     ImGui::SameLine();
-    tcGUICore::dash::led(slaveOn);
-    ImGui::SameLine();
-    tcGUICore::dash::caption(tcGUICore::tr("从站", "Slave"));
+    if (tcGUICore::dash::button(langLabel, ImVec2(langW, rowH), false)) {
+        tcGUICore::toggleLanguage();
+        if (tcGUICore::Application* app = tcGUICore::Application::instance()) {
+            app->setLanguage(tcGUICore::currentLanguage());
+        }
+    }
+    ImGui::PopStyleVar();
+    ImGui::EndGroup();
 }
 
-} // namespace
-
-void drawRobotConsole()
+void drawHome()
 {
-    if (!gAuthed) {
-        drawLogin();
+    if (!masterReady()) {
+        // 会话中 Control Core 掉线：退回登录并禁止操作。
+        gAuthed = false;
+        gPhase = Phase::Login;
+        gLogin.failed = false;
         return;
     }
-    sampleLink();
+    pollMasterLink();
+    syncToolsFromPlc();
     const float footer = ImGui::GetFrameHeightWithSpacing();
     ImVec2 body = ImGui::GetContentRegionAvail();
     body.y -= footer;
@@ -631,23 +874,35 @@ void drawRobotConsole()
     ImGui::BeginChild("##pages", ImVec2(0.0f, 0.0f));
     drawHeader();
     ImGui::Spacing();
-    switch (gPage) {
-    case Page::Gallery:
-        drawGallery();
+    switch (gHomePage) {
+    case HomePage::Instruments:
+        drawInstrumentsPage();
         break;
-    case Page::Plc:
+    case HomePage::Plc:
         drawPlcPage();
         break;
-    case Page::Status:
+    case HomePage::Status:
         drawStatusPage();
-        break;
-    case Page::Master:
-        drawRobotConfig("##cfg_m", tcGUICore::tr("主机器人", "Master"), gMasterSetup, gMasterEp, kMasterId);
-        break;
-    case Page::Slave:
-        drawRobotConfig("##cfg_s", tcGUICore::tr("从机器人", "Slave"), gSlaveSetup, gSlaveEp, kSlaveId);
         break;
     }
     ImGui::EndChild();
+    drawMsLockOverlay();
     ImGui::EndChild();
+}
+
+} // namespace
+
+void drawRobotConsole()
+{
+    switch (gPhase) {
+    case Phase::Boot:
+        drawBoot();
+        break;
+    case Phase::Login:
+        drawLogin();
+        break;
+    case Phase::Home:
+        drawHome();
+        break;
+    }
 }

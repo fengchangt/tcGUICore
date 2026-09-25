@@ -18,7 +18,17 @@
     <LibraryReferences>{924b10db-e1ec-4783-a874-6c968fae166b}</LibraryReferences>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="DUTs\E_MsMode.TcDUT">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="DUTs\ST_ToolBay.TcDUT">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="GVLs\EMSensor.TcGVL">
+      <SubType>Code</SubType>
+      <LinkAlways>true</LinkAlways>
+    </Compile>
+    <Compile Include="GVLs\GVL_Surgeon.TcGVL">
       <SubType>Code</SubType>
       <LinkAlways>true</LinkAlways>
     </Compile>

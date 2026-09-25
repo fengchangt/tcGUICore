@@ -53,10 +53,18 @@ bool Application::loadConfig(const std::string& path)
 {
     LoadedConfig loaded;
     std::string error;
+    const std::string stemJson = title_ + ".json";
+    const std::string exeStemJson = platform::executableStem() + ".json";
     std::vector<std::string> candidates = {
         path,
         (std::filesystem::path(platform::executableDir()) / path).string(),
         (std::filesystem::current_path() / path).string(),
+        exeStemJson,
+        (std::filesystem::path(platform::executableDir()) / exeStemJson).string(),
+        stemJson,
+        (std::filesystem::path(platform::executableDir()) / stemJson).string(),
+        "SurgeonConsole.json",
+        (std::filesystem::path(platform::executableDir()) / "SurgeonConsole.json").string(),
         "plc_symbols.json",
         "plc_symbols",
         (std::filesystem::path(platform::executableDir()) / "plc_symbols.json").string(),
