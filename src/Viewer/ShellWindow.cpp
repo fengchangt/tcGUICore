@@ -24,6 +24,13 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include "imgui_impl_dx11.h"
+#elif defined(__linux__)
+#define GLFW_EXPOSE_NATIVE_X11
+#include <GLFW/glfw3native.h>
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+#include <X11/Xutil.h>
+#include <X11/extensions/shape.h>
 #endif
 
 #include <algorithm>
@@ -58,6 +65,7 @@ struct ShellChrome {
 ShellChrome gChrome;
 AdsHub* gHub = nullptr;
 FrameCallback gProductFrame;
+bool gKioskFullscreen = false;
 
 std::mutex gScanMu;
 std::thread gScanner;
@@ -120,6 +128,8 @@ void joinIpScan()
     }
 }
 
+void updateWindowCorners(GLFWwindow* window);
+
 #ifdef _WIN32
 void setCaptionBlack(GLFWwindow* window)
 {
@@ -161,39 +171,200 @@ void setCaptionBlack(GLFWwindow* window)
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     RedrawWindow(hwnd, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW);
 }
+#endif
 
 void updateWindowCorners(GLFWwindow* window)
 {
-    HWND hwnd = glfwGetWin32Window(window);
-    if (!hwnd) {
+    if (!window) {
         return;
     }
     int width = 0;
     int height = 0;
     glfwGetWindowSize(window, &width, &height);
     const int maximized = glfwGetWindowAttrib(window, GLFW_MAXIMIZED);
+    const bool coverScreen = gKioskFullscreen || maximized || glfwGetWindowMonitor(window) != nullptr;
     static int lastW = -1;
     static int lastH = -1;
     static int lastMax = -1;
-    if (width == lastW && height == lastH && maximized == lastMax) {
+    static int lastCover = -1;
+    if (width == lastW && height == lastH && maximized == lastMax && static_cast<int>(coverScreen) == lastCover) {
         return;
     }
     lastW = width;
     lastH = height;
     lastMax = maximized;
-    if (maximized || width < 2 || height < 2) {
+    lastCover = coverScreen ? 1 : 0;
+
+#ifdef _WIN32
+    HWND hwnd = glfwGetWin32Window(window);
+    if (!hwnd) {
+        return;
+    }
+    if (coverScreen || width < 2 || height < 2) {
         SetWindowRgn(hwnd, nullptr, TRUE);
         return;
     }
     const int ellipse = static_cast<int>(kCornerRadius * 2.0f);
     SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, width + 1, height + 1, ellipse, ellipse), TRUE);
+#elif defined(__linux__)
+    Display* dpy = glfwGetX11Display();
+    const Window xid = glfwGetX11Window(window);
+    if (!dpy || !xid) {
+        return;
+    }
+    if (coverScreen || width < 2 || height < 2) {
+        XShapeCombineMask(dpy, xid, ShapeBounding, 0, 0, None, ShapeSet);
+        return;
+    }
+    const int radius = std::max(1, static_cast<int>(kCornerRadius));
+    Region region = XCreateRegion();
+    if (height > radius * 2) {
+        XRectangle mid{0, static_cast<short>(radius), static_cast<unsigned short>(width),
+            static_cast<unsigned short>(height - radius * 2)};
+        XUnionRectWithRegion(&mid, region, region);
+    }
+    for (int y = 0; y < radius; ++y) {
+        const float dy = static_cast<float>(radius) - static_cast<float>(y) - 0.5f;
+        const int dx = static_cast<int>(std::sqrt(std::max(0.0f, static_cast<float>(radius * radius) - dy * dy)));
+        const int x0 = std::max(0, radius - dx);
+        const int span = std::max(1, width - x0 * 2);
+        XRectangle top{static_cast<short>(x0), static_cast<short>(y), static_cast<unsigned short>(span), 1};
+        XUnionRectWithRegion(&top, region, region);
+        XRectangle bot{static_cast<short>(x0), static_cast<short>(height - 1 - y),
+            static_cast<unsigned short>(span), 1};
+        XUnionRectWithRegion(&bot, region, region);
+    }
+    XShapeCombineRegion(dpy, xid, ShapeBounding, 0, 0, region, ShapeSet);
+    XDestroyRegion(region);
+#else
+    (void)width;
+    (void)height;
+    (void)maximized;
+    (void)coverScreen;
+#endif
 }
 
-int windowEdgeAtCursor();
+#if defined(__linux__)
+void hideNativeDecorations(GLFWwindow* window)
+{
+    if (!window) {
+        return;
+    }
+    glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_FALSE);
+    Display* dpy = glfwGetX11Display();
+    const Window xid = glfwGetX11Window(window);
+    if (!dpy || !xid) {
+        return;
+    }
+    struct MotifHints {
+        unsigned long flags;
+        unsigned long functions;
+        unsigned long decorations;
+        long inputMode;
+        unsigned long status;
+    } hints{};
+    hints.flags = 1 | 2; // MWM_HINTS_FUNCTIONS | MWM_HINTS_DECORATIONS
+    hints.functions = 1 | 2 | 4 | 8 | 16 | 32;
+    hints.decorations = 0;
+    const Atom motif = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
+    XChangeProperty(dpy, xid, motif, motif, 32, PropModeReplace,
+        reinterpret_cast<unsigned char*>(&hints), 5);
 
+    const Atom type = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+    Atom normal = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NORMAL", False);
+    XChangeProperty(dpy, xid, type, XA_ATOM, 32, PropModeReplace,
+        reinterpret_cast<unsigned char*>(&normal), 1);
+    XFlush(dpy);
+}
+
+void requestEwmhFullscreen(GLFWwindow* window)
+{
+    Display* dpy = glfwGetX11Display();
+    const Window xid = glfwGetX11Window(window);
+    if (!dpy || !xid) {
+        return;
+    }
+    const Atom netState = XInternAtom(dpy, "_NET_WM_STATE", False);
+    const Atom fs = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
+    const Atom above = XInternAtom(dpy, "_NET_WM_STATE_ABOVE", False);
+    Atom states[] = {fs, above};
+    XChangeProperty(dpy, xid, netState, XA_ATOM, 32, PropModeReplace,
+        reinterpret_cast<unsigned char*>(states), 2);
+
+    XEvent ev{};
+    ev.xclient.type = ClientMessage;
+    ev.xclient.serial = 0;
+    ev.xclient.send_event = True;
+    ev.xclient.display = dpy;
+    ev.xclient.window = xid;
+    ev.xclient.message_type = netState;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = 1; // _NET_WM_STATE_ADD
+    ev.xclient.data.l[1] = static_cast<long>(fs);
+    ev.xclient.data.l[2] = static_cast<long>(above);
+    ev.xclient.data.l[3] = 1;
+    XSendEvent(dpy, DefaultRootWindow(dpy), False,
+        SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+    XFlush(dpy);
+}
+#endif
+
+void applyKioskFullscreen(GLFWwindow* window)
+{
+    if (!window) {
+        return;
+    }
+    gKioskFullscreen = true;
+    glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_FALSE);
+    glfwSetWindowAttrib(window, GLFW_RESIZABLE, GLFW_FALSE);
+    glfwSetWindowAttrib(window, GLFW_FLOATING, GLFW_TRUE);
+    glfwSetWindowAttrib(window, GLFW_AUTO_ICONIFY, GLFW_FALSE);
+
+    GLFWmonitor* monitor = glfwGetWindowMonitor(window);
+    if (!monitor) {
+        monitor = glfwGetPrimaryMonitor();
+    }
+    if (!monitor) {
+        glfwMaximizeWindow(window);
+        return;
+    }
+    const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+    if (!mode) {
+        glfwMaximizeWindow(window);
+        return;
+    }
+    int mx = 0;
+    int my = 0;
+    glfwGetMonitorPos(monitor, &mx, &my);
+    glfwSetWindowMonitor(window, monitor, mx, my, mode->width, mode->height, mode->refreshRate);
+#if defined(__linux__)
+    requestEwmhFullscreen(window);
+#endif
+}
+
+void maintainKioskFullscreen(GLFWwindow* window)
+{
+    if (!gKioskFullscreen || !window) {
+        return;
+    }
+    static int ticks = 0;
+    if (ticks > 120) {
+        return;
+    }
+    ++ticks;
+    if (glfwGetWindowMonitor(window) == nullptr) {
+        applyKioskFullscreen(window);
+        return;
+    }
+#if defined(__linux__)
+    requestEwmhFullscreen(window);
+#endif
+}
+
+#ifdef _WIN32
 void dragCaption()
 {
-    if (!gChrome.window) {
+    if (!gChrome.window || gKioskFullscreen) {
         return;
     }
     HWND hwnd = glfwGetWin32Window(gChrome.window);
@@ -214,7 +385,7 @@ void dragCaption()
 
 int windowEdgeAtCursor()
 {
-    if (!gChrome.window || glfwGetWindowAttrib(gChrome.window, GLFW_MAXIMIZED)) {
+    if (!gChrome.window || gKioskFullscreen || glfwGetWindowAttrib(gChrome.window, GLFW_MAXIMIZED)) {
         return 0;
     }
     int width = 0;
@@ -251,7 +422,7 @@ void cursorOnScreen(int& sx, int& sy)
 
 void dragCaptionGlfw(bool hovered)
 {
-    if (!gChrome.window) {
+    if (!gChrome.window || gKioskFullscreen) {
         return;
     }
     static bool dragging = false;
@@ -288,6 +459,9 @@ void dragCaptionGlfw(bool hovered)
 
 void pollWindowResize()
 {
+    if (gKioskFullscreen) {
+        return;
+    }
     static int edge = 0;
 #ifdef _WIN32
     static POINT anchor{};
@@ -467,7 +641,8 @@ void drawTitleBar()
     ImGui::PopFont();
 
     ImGui::SetCursorScreenPos(origin);
-    ImGui::InvisibleButton("##caption_drag", ImVec2(std::max(1.0f, width - kBtnW * 3.0f), kBarH));
+    const float dragW = gKioskFullscreen ? width : std::max(1.0f, width - kBtnW * 3.0f);
+    ImGui::InvisibleButton("##caption_drag", ImVec2(dragW, kBarH));
 #ifdef _WIN32
     if (ImGui::IsItemHovered()) {
         dragCaption();
@@ -476,6 +651,7 @@ void drawTitleBar()
     dragCaptionGlfw(ImGui::IsItemHovered());
 #endif
 
+    if (!gKioskFullscreen) {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.14f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 1.0f, 1.0f, 0.24f));
@@ -514,6 +690,7 @@ void drawTitleBar()
 
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(3);
+    }
     ImGui::SetCursorPos(ImVec2(ImGui::GetStyle().WindowPadding.x, kBarH + ImGui::GetStyle().WindowPadding.y));
 }
 
@@ -2141,8 +2318,8 @@ void drawFrameFooter(const ImGuiViewport* vp)
         vp->WorkPos.y + vp->WorkSize.y - textSize.y - pad);
     ImGui::GetForegroundDrawList()->AddText(pos, ImGui::GetColorU32(ImGuiCol_TextDisabled), fps);
 
-    const bool maximized = gChrome.window && glfwGetWindowAttrib(gChrome.window, GLFW_MAXIMIZED);
-    const float rounding = maximized ? 0.0f : kCornerRadius;
+    const bool coverScreen = gKioskFullscreen || (gChrome.window && glfwGetWindowAttrib(gChrome.window, GLFW_MAXIMIZED));
+    const float rounding = coverScreen ? 0.0f : kCornerRadius;
     ImGui::GetForegroundDrawList()->AddRect(
         vp->WorkPos + ImVec2(1.0f, 1.0f),
         vp->WorkPos + vp->WorkSize - ImVec2(1.0f, 1.0f),
@@ -2151,7 +2328,7 @@ void drawFrameFooter(const ImGuiViewport* vp)
         0,
         1.0f);
     ImGui::End();
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);
 }
 
 void drawPlcConnectionBarImpl()
@@ -2238,6 +2415,8 @@ void drawExplorerFrame()
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    const bool coverScreen = gKioskFullscreen || (gChrome.window && glfwGetWindowAttrib(gChrome.window, GLFW_MAXIMIZED));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, coverScreen ? 0.0f : kCornerRadius);
     ImGui::Begin("##explorer", nullptr,
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
@@ -2325,6 +2504,7 @@ int ShellWindow::run()
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+    glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE);
     GLFWwindow* window = glfwCreateWindow(window_.width, window_.height, title_.c_str(), nullptr, nullptr);
 #else
     // Ubuntu 虚拟机一般有 OpenGL 3.3。树莓派桌面多为 3.1 / ES3，逐级降级。
@@ -2341,21 +2521,27 @@ int ShellWindow::run()
         {3, 1, GLFW_OPENGL_ANY_PROFILE, GLFW_OPENGL_API, "#version 140"},
         {3, 0, GLFW_OPENGL_ANY_PROFILE, GLFW_OPENGL_ES_API, "#version 300 es"},
     };
-    for (const GlAttempt& attempt : glAttempts) {
-        glfwDefaultWindowHints();
-        glfwWindowHint(GLFW_CLIENT_API, attempt.clientApi);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, attempt.major);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, attempt.minor);
-        if (attempt.clientApi == GLFW_OPENGL_API) {
-            glfwWindowHint(GLFW_OPENGL_PROFILE, attempt.profile);
+    for (int round = 0; round < 10 && !window; ++round) {
+        if (round > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
         }
-        glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE);
-        glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
-        glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
-        window = glfwCreateWindow(window_.width, window_.height, title_.c_str(), nullptr, nullptr);
-        if (window) {
-            glslVersion = attempt.glsl;
-            break;
+        for (const GlAttempt& attempt : glAttempts) {
+            glfwDefaultWindowHints();
+            glfwWindowHint(GLFW_CLIENT_API, attempt.clientApi);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, attempt.major);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, attempt.minor);
+            if (attempt.clientApi == GLFW_OPENGL_API) {
+                glfwWindowHint(GLFW_OPENGL_PROFILE, attempt.profile);
+            }
+            glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE);
+            glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+            glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+            glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE);
+            window = glfwCreateWindow(window_.width, window_.height, title_.c_str(), nullptr, nullptr);
+            if (window) {
+                glslVersion = attempt.glsl;
+                break;
+            }
         }
     }
 #endif
@@ -2373,20 +2559,29 @@ int ShellWindow::run()
     gProductFrame = onFrame_;
 #ifdef _WIN32
     setCaptionBlack(window);
-    updateWindowCorners(window);
 #endif
+#if defined(__linux__)
+    hideNativeDecorations(window);
+#endif
+    updateWindowCorners(window);
     glfwShowWindow(window);
-#ifdef _WIN32
-    updateWindowCorners(window);
-#else
-    // 触摸屏外发：export TCGUICORE_MAXIMIZE=1 启动时最大化。
-    if (const char* maximize = std::getenv("TCGUICORE_MAXIMIZE")) {
-        if (maximize[0] == '1' || maximize[0] == 'y' || maximize[0] == 'Y' || maximize[0] == 't' ||
-            maximize[0] == 'T') {
-            glfwMaximizeWindow(window);
-        }
-    }
+#if defined(__linux__)
+    hideNativeDecorations(window);
 #endif
+    updateWindowCorners(window);
+    auto envFlag = [](const char* name) {
+        const char* value = std::getenv(name);
+        if (!value || value[0] == '\0') {
+            return false;
+        }
+        const char c = value[0];
+        return c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T';
+    };
+    if (window_.fullscreen || envFlag("TCGUICORE_FULLSCREEN") || envFlag("TCGUICORE_MAXIMIZE")) {
+        applyKioskFullscreen(window);
+    } else if (window_.maximize) {
+        glfwMaximizeWindow(window);
+    }
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -2397,6 +2592,16 @@ int ShellWindow::run()
     io.IniFilename = nullptr;
 
     applyIndustrialDarkTheme();
+    {
+        int fbW = 0;
+        int fbH = 0;
+        glfwGetFramebufferSize(window, &fbW, &fbH);
+        // 7" 1920x1080 触摸屏：按高度放大控件，保证按键约 8mm。
+        setUiScale(std::clamp(static_cast<float>(fbH > 0 ? fbH : window_.height) / 620.0f, 1.0f, 2.0f));
+        ImGui::GetStyle().ScaleAllSizes(uiScale());
+        ImGui::GetStyle().TouchExtraPadding = ImVec2(8.0f, 8.0f);
+        ImGui::GetStyle().FontSizeBase = 18.0f * uiScale();
+    }
     loadDefaultFonts();
     ImPlot::StyleColorsDark();
     ImPlot3D::StyleColorsDark();
@@ -2469,6 +2674,9 @@ int ShellWindow::run()
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glslVersion);
 #endif
+    if (gKioskFullscreen) {
+        applyKioskFullscreen(window);
+    }
 
     logInfo(std::string(tr("启动界面: ", "UI start: ")) + title_);
 
@@ -2497,9 +2705,8 @@ int ShellWindow::run()
     while (!glfwWindowShouldClose(window)) {
         const auto frameStart = frame_clock::now();
         glfwPollEvents();
-#ifdef _WIN32
+        maintainKioskFullscreen(window);
         updateWindowCorners(window);
-#endif
 
 #ifdef _WIN32
         ImGui_ImplDX11_NewFrame();
@@ -2586,6 +2793,13 @@ int ShellWindow::run()
     glfwDestroyWindow(window);
     glfwTerminate();
     return 0;
+}
+
+void ShellWindow::requestClose()
+{
+    if (gChrome.window) {
+        glfwSetWindowShouldClose(gChrome.window, GLFW_TRUE);
+    }
 }
 
 } // namespace tcGUICore

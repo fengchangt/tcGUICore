@@ -50,6 +50,13 @@ if(TCGUICORE_SOURCES)
         # std::thread / dlopen。Windows 上 Threads::Threads 为空。
         target_link_libraries(tcGUICore PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
     endif()
+    if(UNIX AND NOT APPLE)
+        find_package(X11 REQUIRED)
+        target_link_libraries(tcGUICore PUBLIC X11::X11)
+        if(X11_Xext_FOUND)
+            target_link_libraries(tcGUICore PUBLIC ${X11_Xext_LIB})
+        endif()
+    endif()
     target_include_directories(tcGUICore PUBLIC ${TCGUICORE_PUBLIC_INCLUDES})
     set_target_properties(tcGUICore PROPERTIES
         POSITION_INDEPENDENT_CODE ON

@@ -156,6 +156,9 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 include(tcGUICoreAddApp)
 
+# Imported Threads::Threads is directory-scoped; find it here so src/ can link it.
+find_package(Threads REQUIRED)
+
 add_subdirectory(thirdparty)
 add_subdirectory(src)
 

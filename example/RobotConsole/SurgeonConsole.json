@@ -3,16 +3,18 @@
     "zh": "Surgeon Console 专用 PLC 映射。代码只认 name；PLC 地址变了只改 symbol。",
     "en": "Surgeon Console PLC map. Code binds to name; change symbol when ADS path changes."
   },
-  "window": {
+    "window": {
     "width": 1600,
     "height": 900,
-    "language": "zh"
+    "language": "zh",
+    "maximize": true,
+    "fullscreen": true
   },
   "plcs": [
     {
       "id": "master",
       "displayName": { "zh": "Control Core", "en": "Control Core" },
-      "ip": "127.0.0.1",
+      "ip": "172.13.158.64",
       "adsPort": 851,
       "timeoutMs": 2000,
       "variables": [

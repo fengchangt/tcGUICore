@@ -12,6 +12,8 @@ public:
     ShellWindow(std::string title, AdsHub& hub, FrameCallback onFrame, WindowConfig window);
     int run();
 
+    static void requestClose();
+
 private:
     std::string title_;
     AdsHub& hub_;

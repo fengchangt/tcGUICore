@@ -1,5 +1,7 @@
 #include "DashWidgets.h"
 
+#include "Theme.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -10,6 +12,11 @@ namespace {
 ImU32 pack(const ImVec4& color)
 {
     return ImGui::ColorConvertFloat4ToU32(color);
+}
+
+float px(float v)
+{
+    return v * tcGUICore::uiScale();
 }
 
 const Palette kPalette{
@@ -63,9 +70,16 @@ bool beginCard(const char* id, const ImVec2& size)
     ImGui::PushStyleColor(ImGuiCol_ChildBg, kPalette.card);
     ImGui::PushStyleColor(ImGuiCol_Border, kPalette.cardBorder);
     ImGui::PushStyleColor(ImGuiCol_Text, kPalette.text);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 16.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 14.0f));
-    return ImGui::BeginChild(id, size, ImGuiChildFlags_Borders);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, px(16.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(16.0f), px(14.0f)));
+    ImGuiChildFlags flags = ImGuiChildFlags_Borders;
+    ImVec2 childSize = size;
+    // 指定宽度、高度为 0：按内容增高，避免 Win/Linux 字体行高不同把固定卡片裁切或留白。
+    if (size.x > 0.0f && size.y == 0.0f) {
+        flags |= ImGuiChildFlags_AutoResizeY;
+        childSize.y = 0.0f;
+    }
+    return ImGui::BeginChild(id, childSize, flags);
 }
 
 void endCard()
@@ -102,6 +116,7 @@ void hint(const char* text)
 
 void led(bool on, float radius)
 {
+    radius = px(radius);
     const float h = ImGui::GetFrameHeight();
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const ImVec2 c(p.x + radius + 2.0f, p.y + h * 0.5f);
@@ -120,7 +135,7 @@ void led(bool on, float radius)
 void progress(float fraction)
 {
     const float width = ImGui::GetContentRegionAvail().x;
-    const float height = 6.0f;
+    const float height = px(6.0f);
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     const ImVec2 a = p;
@@ -146,8 +161,8 @@ void progress(float fraction)
 
 bool toggle(const char* id, bool* value)
 {
-    const float width = 46.0f;
-    const float height = 26.0f;
+    const float width = px(46.0f);
+    const float height = px(26.0f);
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton(id, ImVec2(width, height));
     const bool pressed = ImGui::IsItemClicked();
@@ -171,12 +186,12 @@ bool toggle(const char* id, bool* value)
 
 bool toggleRow(const char* id, const char* label, bool* value)
 {
-    const float row = 26.0f;
+    const float row = px(26.0f);
     const float y = ImGui::GetCursorPosY() + (row - ImGui::GetTextLineHeight()) * 0.5f;
     ImGui::SetCursorPosY(y);
     caption(label);
     ImGui::SameLine();
-    const float toggleWidth = 46.0f;
+    const float toggleWidth = px(46.0f);
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - toggleWidth);
     ImGui::SetCursorPosY(y - (row - ImGui::GetTextLineHeight()) * 0.5f);
     return toggle(id, value);
@@ -186,7 +201,7 @@ bool slider(const char* id, float* value, float vMin, float vMax)
 {
     ImGui::PushID(id);
     const float width = std::max(48.0f, ImGui::CalcItemWidth());
-    const float height = 22.0f;
+    const float height = px(28.0f);
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##track", ImVec2(width, height));
     bool changed = false;
@@ -204,7 +219,7 @@ bool slider(const char* id, float* value, float vMin, float vMax)
     }
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     const float midY = pos.y + height * 0.5f;
-    const float trackH = 6.0f;
+    const float trackH = px(8.0f);
     drawList->AddRectFilled(
         ImVec2(pos.x, midY - trackH * 0.5f),
         ImVec2(pos.x + width, midY + trackH * 0.5f),
@@ -218,15 +233,15 @@ bool slider(const char* id, float* value, float vMin, float vMax)
             3.0f);
     }
     const bool hot = ImGui::IsItemHovered() || ImGui::IsItemActive();
-    drawList->AddCircleFilled(ImVec2(pos.x + width * t, midY), hot ? 9.0f : 7.5f, pack(kPalette.knob));
+    drawList->AddCircleFilled(ImVec2(pos.x + width * t, midY), hot ? px(12.0f) : px(10.0f), pack(kPalette.knob));
     ImGui::PopID();
     return changed;
 }
 
 bool button(const char* label, const ImVec2& size, bool primary)
 {
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 12.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, px(12.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(px(14.0f), px(10.0f)));
     if (primary) {
         ImGui::PushStyleColor(ImGuiCol_Button, kPalette.green);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.38f, 0.90f, 0.56f, 1.0f));
@@ -252,9 +267,9 @@ bool textField(const char* id, char* buffer, std::size_t bufferSize, ImGuiInputT
     ImGui::PushStyleColor(ImGuiCol_FrameBg, kPalette.field);
     ImGui::PushStyleColor(ImGuiCol_Border, kPalette.cardBorder);
     ImGui::PushStyleColor(ImGuiCol_Text, kPalette.text);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, px(10.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(px(14.0f), px(12.0f)));
     const bool changed = ImGui::InputText(id, buffer, bufferSize, flags);
     ImGui::PopStyleVar(3);
     ImGui::PopStyleColor(3);
@@ -287,7 +302,7 @@ bool numberField(const char* id, int* value, int vMin, int vMax)
 
 bool check(const char* id, const char* label, bool* value)
 {
-    const float box = 18.0f;
+    const float box = px(22.0f);
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const ImVec2 text = ImGui::CalcTextSize(label ? label : "");
     const ImVec2 size(box + 8.0f + text.x, std::max(box, text.y));
@@ -338,7 +353,7 @@ void badge(const char* label, Accent accent)
 {
     const ImVec2 text = ImGui::CalcTextSize(label);
     const ImVec2 p = ImGui::GetCursorScreenPos();
-    const ImVec2 size(text.x + 16.0f, 22.0f);
+    const ImVec2 size(text.x + px(20.0f), px(28.0f));
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     ImVec4 fill = ImGui::ColorConvertU32ToFloat4(colorOf(accent));
     fill.w = 0.22f;
@@ -362,9 +377,9 @@ bool combo(const char* id, int* current, const char* const items[], int count)
     ImGui::PushStyleColor(ImGuiCol_PopupBg, kPalette.card);
     ImGui::PushStyleColor(ImGuiCol_Header, kPalette.greenDim);
     ImGui::PushStyleColor(ImGuiCol_Text, kPalette.text);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 12.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, px(10.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, px(12.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(px(12.0f), px(10.0f)));
     const bool changed = ImGui::Combo(id, current, items, count);
     ImGui::PopStyleVar(3);
     ImGui::PopStyleColor(4);
@@ -374,7 +389,7 @@ bool combo(const char* id, int* current, const char* const items[], int count)
 bool chip(const char* label, bool selected, Accent accent)
 {
     const ImVec2 text = ImGui::CalcTextSize(label);
-    const ImVec2 size(text.x + 22.0f, 28.0f);
+    const ImVec2 size(text.x + px(28.0f), px(36.0f));
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::PushID(label);
     ImGui::InvisibleButton("##chip", size);
@@ -391,6 +406,7 @@ bool chip(const char* label, bool selected, Accent accent)
 
 bool iconButton(const char* id, IconFn icon, bool active, float side)
 {
+    side = px(side);
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton(id, ImVec2(side, side));
     const bool pressed = ImGui::IsItemClicked();
@@ -448,6 +464,14 @@ void iconPower(ImDrawList* drawList, ImVec2 c, ImU32 color)
     drawList->PathArcTo(c, 6.5f, 0.7f, 5.6f, 16);
     drawList->PathStroke(color, 0, 1.6f);
     stroke(drawList, ImVec2(c.x, c.y - 8.0f), ImVec2(c.x, c.y - 1.0f), color);
+}
+
+void iconExit(ImDrawList* drawList, ImVec2 c, ImU32 color)
+{
+    drawList->AddRect(ImVec2(c.x - 7.0f, c.y - 7.0f), ImVec2(c.x + 2.0f, c.y + 7.0f), color, 1.5f, 0, 1.6f);
+    stroke(drawList, ImVec2(c.x - 1.0f, c.y), ImVec2(c.x + 8.0f, c.y), color);
+    stroke(drawList, ImVec2(c.x + 4.0f, c.y - 4.0f), ImVec2(c.x + 8.0f, c.y), color);
+    stroke(drawList, ImVec2(c.x + 4.0f, c.y + 4.0f), ImVec2(c.x + 8.0f, c.y), color);
 }
 
 void iconTiles(ImDrawList* drawList, ImVec2 c, ImU32 color)

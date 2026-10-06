@@ -124,4 +124,9 @@ int Application::run()
     return shell.run();
 }
 
+void Application::quit()
+{
+    ShellWindow::requestClose();
+}
+
 } // namespace tcGUICore

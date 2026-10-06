@@ -57,6 +57,8 @@ struct WindowConfig {
     int width = kDefaultWindowWidth;
     int height = kDefaultWindowHeight;
     Language language = Language::Zh;
+    bool maximize = false;
+    bool fullscreen = false;
 };
 
 struct PlcConfig {

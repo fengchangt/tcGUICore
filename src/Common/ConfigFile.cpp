@@ -324,6 +324,12 @@ bool loadPlcConfigFile(const std::string& path, LoadedConfig& out, std::string& 
                 const std::string ls = lang->asString();
                 out.window.language = (ls == "en" || ls == "EN") ? Language::En : Language::Zh;
             }
+            if (const Json* max = w->child("maximize")) {
+                out.window.maximize = max->asBool(false);
+            }
+            if (const Json* full = w->child("fullscreen")) {
+                out.window.fullscreen = full->asBool(false);
+            }
         }
         const Json* plcs = root.child("plcs");
         if (!plcs || plcs->type != Json::Array) {
@@ -343,6 +349,9 @@ bool loadPlcConfigFile(const std::string& path, LoadedConfig& out, std::string& 
             if (const Json* ip = p.child("ip")) {
                 plc.ip = ip->asString();
             }
+            if (const Json* netId = p.child("amsNetId")) {
+                plc.amsNetId = netId->asString();
+            }
             if (const Json* port = p.child("adsPort")) {
                 plc.adsPort = static_cast<uint16_t>(port->asNumber(851));
             }
@@ -352,7 +361,9 @@ bool loadPlcConfigFile(const std::string& path, LoadedConfig& out, std::string& 
             if (plc.id.empty() || plc.ip.empty()) {
                 throw std::runtime_error("each PLC needs id and ip");
             }
-            plc.amsNetId = amsNetIdFromIp(plc.ip);
+            if (plc.amsNetId.empty()) {
+                plc.amsNetId = amsNetIdFromIp(plc.ip);
+            }
             plc.configAmsNetId = plc.amsNetId;
             out.plcs.push_back(plc);
 

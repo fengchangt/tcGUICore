@@ -62,6 +62,7 @@ void iconPulse(ImDrawList* drawList, ImVec2 center, ImU32 color);
 void iconArm(ImDrawList* drawList, ImVec2 center, ImU32 color);
 void iconArmPair(ImDrawList* drawList, ImVec2 center, ImU32 color);
 void iconPower(ImDrawList* drawList, ImVec2 center, ImU32 color);
+void iconExit(ImDrawList* drawList, ImVec2 center, ImU32 color);
 void iconTiles(ImDrawList* drawList, ImVec2 center, ImU32 color);
 
 void sparkline(const float* samples, int count, const ImVec2& size, float yMin = 0.0f, float yMax = 1.0f);

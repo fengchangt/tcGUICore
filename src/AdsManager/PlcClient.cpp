@@ -20,7 +20,9 @@
 #include "AdsException.h"
 #include "AdsLib.h"
 
+#include <cstdio>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -259,6 +261,44 @@ struct RouterLink {
 };
 #endif
 
+bool amsNetIdZero(const AmsNetId& id)
+{
+    return (id.b[0] | id.b[1] | id.b[2] | id.b[3] | id.b[4] | id.b[5]) == 0;
+}
+
+std::string formatAmsNetId(const AmsNetId& id)
+{
+    char text[40];
+    std::snprintf(text, sizeof(text), "%u.%u.%u.%u.%u.%u",
+        static_cast<unsigned>(id.b[0]), static_cast<unsigned>(id.b[1]),
+        static_cast<unsigned>(id.b[2]), static_cast<unsigned>(id.b[3]),
+        static_cast<unsigned>(id.b[4]), static_cast<unsigned>(id.b[5]));
+    return text;
+}
+
+// AdsLib：按 IP 读取对方 TwinCAT 的真实 AMS NetId（不要用 IP.1.1 猜测）。
+bool resolveRemoteAmsNetId(const std::string& ip, std::string& netIdText, std::string& error)
+{
+    try {
+        AmsNetId remote{};
+        const long err = bhf::ads::GetRemoteAddress(ip, remote);
+        if (err != 0) {
+            error = std::string("AdsLib GetRemoteAddress ") + ip +
+                tr(" 失败，错误码 ", " failed, error ") + std::to_string(err);
+            return false;
+        }
+        if (amsNetIdZero(remote)) {
+            error = tr("AdsLib GetRemoteAddress 返回空 NetId", "AdsLib GetRemoteAddress returned empty NetId");
+            return false;
+        }
+        netIdText = formatAmsNetId(remote);
+        return true;
+    } catch (const std::exception& ex) {
+        error = std::string("AdsLib GetRemoteAddress ") + ip + ": " + ex.what();
+        return false;
+    }
+}
+
 } // namespace
 
 struct PlcClient::DeviceHolder {
@@ -337,8 +377,15 @@ std::string PlcClient::sessionAmsNetId() const
 bool PlcClient::netIdMatches(const std::string& expectedAmsNetId) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return state_ == ConnectionState::Connected && !expectedAmsNetId.empty() &&
-        sessionAmsNetId_ == expectedAmsNetId;
+    if (state_ != ConnectionState::Connected || sessionAmsNetId_.empty()) {
+        return false;
+    }
+    if (expectedAmsNetId.empty() || expectedAmsNetId == sessionAmsNetId_) {
+        return true;
+    }
+    // JSON 可能仍写着 IP.1.1；会话已用 GetRemoteAddress 的真实 NetId。
+    return expectedAmsNetId == config_.configAmsNetId ||
+        expectedAmsNetId == amsNetIdFromIp(config_.ip);
 }
 
 void PlcClient::joinWorker()
@@ -377,9 +424,38 @@ void PlcClient::connectWorker()
         cfg = config_;
     }
 
+    if (cfg.ip.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastError_ = tr("IP 无效", "Invalid IP");
+        adsStateText_ = "—";
+        device_.reset();
+        state_ = ConnectionState::Error;
+        logError(lastError_);
+        return;
+    }
+
+    std::string remoteNetId;
+    std::string resolveError;
+    if (resolveRemoteAmsNetId(cfg.ip, remoteNetId, resolveError)) {
+        if (cfg.amsNetId != remoteNetId) {
+            logInfo(std::string("AdsLib GetRemoteAddress ") + cfg.ip + " -> " + remoteNetId +
+                (cfg.amsNetId.empty() ? std::string() : (std::string(" (") +
+                    tr("配置曾为 ", "config was ") + cfg.amsNetId + ")")));
+        }
+        cfg.amsNetId = remoteNetId;
+        std::lock_guard<std::mutex> lock(mutex_);
+        config_.amsNetId = remoteNetId;
+        config_.configAmsNetId = remoteNetId;
+    } else {
+        logWarn(resolveError + tr("，回退配置 NetId ", ", falling back to config NetId ") +
+            (cfg.amsNetId.empty() ? amsNetIdFromIp(cfg.ip) : cfg.amsNetId));
+        if (cfg.amsNetId.empty()) {
+            cfg.amsNetId = amsNetIdFromIp(cfg.ip);
+        }
+    }
+
     const AmsNetId netId = make_AmsNetId(cfg.amsNetId);
-    const bool netIdZero = (netId.b[0] | netId.b[1] | netId.b[2] | netId.b[3] | netId.b[4] | netId.b[5]) == 0;
-    if (cfg.ip.empty() || netIdZero) {
+    if (amsNetIdZero(netId)) {
         std::lock_guard<std::mutex> lock(mutex_);
         lastError_ = tr("IP 或 AMS NetId 无效", "Invalid IP or AMS NetId");
         adsStateText_ = "—";
@@ -488,6 +564,13 @@ void PlcClient::connectWorker()
         adsStateText_ = "—";
         state_ = ConnectionState::Error;
         logError(std::string(tr("连接失败: ", "Connect failed: ")) + lastError_);
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        device_.reset();
+        lastError_ = tr("连接失败", "Connect failed");
+        adsStateText_ = "—";
+        state_ = ConnectionState::Error;
+        logError(lastError_);
     }
 }
 

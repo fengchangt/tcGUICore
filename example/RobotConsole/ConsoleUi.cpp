@@ -2,6 +2,7 @@
 
 #include "AdsManager/PlcClient.h"
 #include "Common/I18n.h"
+#include "Viewer/Theme.h"
 #include "tcGUICore.h"
 
 #include <algorithm>
@@ -18,6 +19,7 @@ constexpr float kPlcRetrySec = 1.5f;
 
 enum class Phase { Boot, Login, Home };
 enum class HomePage { Instruments, Plc, Status };
+enum class OskTarget { None, User, Password };
 
 struct LoginForm {
     char user[64] = "admin";
@@ -40,7 +42,11 @@ Phase gPhase = Phase::Boot;
 HomePage gHomePage = HomePage::Instruments;
 bool gAuthed = false;
 LoginForm gLogin;
-Endpoint gMasterEp{"127.0.0.1", 851};
+OskTarget gOsk = OskTarget::None;
+bool gOskShift = false;
+bool gOskDigits = false;
+float gOskSlide = 0.0f;
+Endpoint gMasterEp{"172.13.158.64", 851};
 double gBootStart = -1.0;
 double gLastPlcTry = -1.0;
 
@@ -311,6 +317,176 @@ void drawBoot()
     }
 }
 
+float px(float v)
+{
+    return v * tcGUICore::uiScale();
+}
+
+struct OskMetrics {
+    float width = 0.0f;
+    float height = 0.0f;
+    float keyH = 0.0f;
+    float gap = 0.0f;
+    float pad = 0.0f;
+};
+
+OskMetrics makeOskMetrics(const ImVec2& avail)
+{
+    OskMetrics m;
+    m.gap = px(8.0f);
+    m.pad = px(12.0f);
+    m.keyH = std::clamp(avail.y * 0.088f, px(64.0f), px(86.0f));
+    m.height = m.pad * 2.0f + m.keyH * 4.0f + m.gap * 3.0f + 2.0f;
+    m.width = std::min(std::max(px(640.0f), avail.x * 0.88f), std::max(px(320.0f), avail.x - px(20.0f)));
+    m.width = std::min(std::max(px(640.0f), avail.x * 0.88f), std::max(px(320.0f), avail.x - px(20.0f)));
+    return m;
+}
+
+void oskAppend(char* buf, std::size_t cap, char ch)
+{
+    if (!buf || cap < 2) {
+        return;
+    }
+    const std::size_t n = std::strlen(buf);
+    if (n + 1 >= cap) {
+        return;
+    }
+    buf[n] = ch;
+    buf[n + 1] = '\0';
+}
+
+void oskBackspace(char* buf)
+{
+    if (!buf) {
+        return;
+    }
+    const std::size_t n = std::strlen(buf);
+    if (n > 0) {
+        buf[n - 1] = '\0';
+    }
+}
+
+// 触摸屏屏幕键盘：四行正好铺满，无滚动条，自底部滑入。
+void drawOnscreenKeyboard(const ImVec2& origin, const ImVec2& avail, char* buf, std::size_t cap, float slide)
+{
+    const auto& pal = tcGUICore::dash::palette();
+    const OskMetrics m = makeOskMetrics(avail);
+    const float kGap = m.gap;
+    const float y = origin.y + avail.y - m.height * slide;
+    ImGui::SetCursorScreenPos(ImVec2(origin.x + (avail.x - m.width) * 0.5f, y));
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.13f, 0.15f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_Border, pal.cardBorder);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, px(16.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(m.pad, m.pad));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(kGap, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 0.0f);
+    ImGui::BeginChild("##osk", ImVec2(m.width, m.height), ImGuiChildFlags_Borders,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoNav);
+
+    const float inner = ImGui::GetContentRegionAvail().x;
+    const float unit = (inner - m.gap * 9.0f) / 10.0f;
+    const float keyH = m.keyH;
+
+    auto keyBtn = [&](const char* id, const char* label, float w, bool primary = false) -> bool {
+        ImGui::PushID(id);
+        const bool hit = tcGUICore::dash::button(label, ImVec2(w, keyH), primary);
+        ImGui::PopID();
+        return hit;
+    };
+
+    auto letterKey = [&](char base, bool shifted) {
+        char ch = base;
+        if (shifted && ch >= 'a' && ch <= 'z') {
+            ch = static_cast<char>(ch - 'a' + 'A');
+        }
+        char id[4] = {base, 0, 0, 0};
+        char lab[4] = {ch, 0, 0, 0};
+        if (keyBtn(id, lab, unit) && buf) {
+            oskAppend(buf, cap, ch);
+        }
+    };
+
+    auto typeUnits = [&](const char* keys, float indent) {
+        if (indent > 0.5f) {
+            ImGui::Dummy(ImVec2(indent, keyH));
+            ImGui::SameLine(0.0f, 0.0f);
+        }
+        const int n = static_cast<int>(std::strlen(keys));
+        for (int i = 0; i < n; ++i) {
+            if (i > 0) {
+                ImGui::SameLine(0.0f, kGap);
+            }
+            letterKey(keys[i], !gOskDigits && gOskShift);
+        }
+    };
+
+    if (gOskDigits) {
+        typeUnits("1234567890", 0.0f);
+        ImGui::Dummy(ImVec2(0.0f, kGap));
+        typeUnits("-_@.#/=+", unit * 1.0f + kGap * 0.5f);
+        ImGui::Dummy(ImVec2(0.0f, kGap));
+        ImGui::Dummy(ImVec2(unit * 1.5f + kGap * 0.5f, keyH));
+        ImGui::SameLine(0.0f, 0.0f);
+        typeUnits("!?*", 0.0f);
+    } else {
+        typeUnits("qwertyuiop", 0.0f);
+        ImGui::Dummy(ImVec2(0.0f, kGap));
+        typeUnits("asdfghjkl", unit * 0.5f + kGap * 0.5f);
+        ImGui::Dummy(ImVec2(0.0f, kGap));
+        if (keyBtn("shift", gOskShift ? "SHIFT" : "Shift", unit * 1.5f + kGap * 0.5f, gOskShift)) {
+            gOskShift = !gOskShift;
+        }
+        ImGui::SameLine(0.0f, kGap);
+        typeUnits("zxcvbnm", 0.0f);
+        ImGui::SameLine(0.0f, kGap);
+        if (keyBtn("bs", tcGUICore::tr("删除", "Del"), unit * 1.5f + kGap * 0.5f) && buf) {
+            oskBackspace(buf);
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0.0f, kGap));
+    const float hideW = std::max(unit * 2.0f + kGap * 0.5f,
+        ImGui::CalcTextSize(tcGUICore::tr("收起", "Hide")).x + px(28.0f));
+    const float leftW = unit * 1.5f + kGap * 0.5f;
+    if (gOskDigits) {
+        const float spaceW = std::max(unit * 2.5f, inner - leftW * 2.0f - hideW - kGap * 3.0f);
+        if (keyBtn("abc", "ABC", leftW)) {
+            gOskDigits = false;
+        }
+        ImGui::SameLine(0.0f, kGap);
+        if (keyBtn("bs2", tcGUICore::tr("删除", "Del"), leftW) && buf) {
+            oskBackspace(buf);
+        }
+        ImGui::SameLine(0.0f, kGap);
+        if (keyBtn("space", tcGUICore::tr("空格", "Space"), spaceW) && buf) {
+            oskAppend(buf, cap, ' ');
+        }
+        ImGui::SameLine(0.0f, kGap);
+        if (keyBtn("hide", tcGUICore::tr("收起", "Hide"), hideW)) {
+            gOsk = OskTarget::None;
+        }
+    } else {
+        const float spaceW = std::max(unit * 3.0f, inner - leftW - hideW - kGap * 2.0f);
+        if (keyBtn("123", "123", leftW)) {
+            gOskDigits = true;
+            gOskShift = false;
+        }
+        ImGui::SameLine(0.0f, kGap);
+        if (keyBtn("space", tcGUICore::tr("空格", "Space"), spaceW) && buf) {
+            oskAppend(buf, cap, ' ');
+        }
+        ImGui::SameLine(0.0f, kGap);
+        if (keyBtn("hide", tcGUICore::tr("收起", "Hide"), hideW)) {
+            gOsk = OskTarget::None;
+        }
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(4);
+    ImGui::PopStyleColor(2);
+}
+
 void drawLogin()
 {
     pollMasterLink();
@@ -319,8 +495,8 @@ void drawLogin()
     tcGUICore::PlcClient* plc = clientOf(kMasterId);
     const auto& pal = tcGUICore::dash::palette();
 
-    // 首次进入：用 JSON 里的 Control Core 地址初始化编辑框。
-    if (plc && gMasterEp.ip[0] != '\0') {
+    // 地址不在登录页编辑：默认 / JSON 为 172.13.158.64:851。
+    if (plc) {
         static bool seeded = false;
         if (!seeded) {
             const auto cfg = plc->config();
@@ -334,19 +510,31 @@ void drawLogin()
         }
     }
 
-    // 标题栏下方剩余区域：用屏幕坐标居中，避免 SetCursorPos 相对窗口顶导致偏上。
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(origin, origin + avail, pack(pal.window));
 
-    const ImVec2 card(440.0f, plcOn ? 460.0f : 560.0f);
-    const float padX = std::max(0.0f, (avail.x - card.x) * 0.5f);
-    const float padY = std::max(0.0f, (avail.y - card.y) * 0.5f);
+    const OskMetrics osk = makeOskMetrics(avail);
+    const float targetSlide = gOsk != OskTarget::None ? 1.0f : 0.0f;
+    const float dt = std::max(0.0f, ImGui::GetIO().DeltaTime);
+    const float ease = 1.0f - std::exp(-12.0f * dt);
+    gOskSlide += (targetSlide - gOskSlide) * ease;
+    if (std::fabs(gOskSlide - targetSlide) < 0.002f) {
+        gOskSlide = targetSlide;
+    }
+
+    const float kCardW = px(480.0f);
+    static ImVec2 cardSize(480.0f, 420.0f);
+    static OskTarget lastOsk = OskTarget::Password;
+    const float kbShown = osk.height * gOskSlide;
+    const float padX = std::max(0.0f, (avail.x - cardSize.x) * 0.5f);
+    const float roomY = std::max(0.0f, avail.y - kbShown);
+    const float padY = std::max(px(8.0f), (roomY - cardSize.y) * 0.5f);
     ImGui::SetCursorScreenPos(origin + ImVec2(padX, padY));
 
-    tcGUICore::dash::beginCard("##login", card);
-    tcGUICore::dash::title("Surgeon Console", 28.0f);
+    tcGUICore::dash::beginCard("##login", ImVec2(kCardW, 0.0f));
+    tcGUICore::dash::title("Surgeon Console", px(32.0f));
     tcGUICore::dash::hint(tcGUICore::tr("医生控制台登录", "Surgeon console sign-in"));
     ImGui::Spacing();
 
@@ -364,72 +552,30 @@ void drawLogin()
     ImGui::Spacing();
     tcGUICore::dash::hint(plcOn
             ? tcGUICore::tr("Control Core 已连接，可以登录。", "Control Core linked. You may sign in.")
-            : tcGUICore::tr("正在等待 Control Core 并自动重试连接…",
-                "Waiting for Control Core; auto-retrying connection…"));
-    if (!plcOn && plc) {
-        const std::string detail = plc->lastError().empty() ? plc->statusText() : plc->lastError();
-        if (!detail.empty() && detail != "—") {
-            ImGui::PushStyleColor(ImGuiCol_Text, pal.muted);
-            ImGui::TextWrapped("%s", detail.c_str());
-            ImGui::PopStyleColor();
-        }
-        ImGui::Spacing();
-        tcGUICore::dash::caption("IP");
-        ImGui::SetNextItemWidth(-1.0f);
-        if (tcGUICore::dash::textField("##login_ip", gMasterEp.ip, sizeof(gMasterEp.ip))) {
-            gLastPlcTry = -1.0;
-        }
-        tcGUICore::dash::caption(tcGUICore::tr("端口", "Port"));
-        ImGui::SetNextItemWidth(160.0f);
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, pal.field);
-        ImGui::PushStyleColor(ImGuiCol_Text, pal.text);
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
-        if (ImGui::InputInt("##login_port", &gMasterEp.port)) {
-            gLastPlcTry = -1.0;
-        }
-        ImGui::PopStyleVar();
-        ImGui::PopStyleColor(2);
-        if (gMasterEp.port < 1) {
-            gMasterEp.port = 851;
-        }
-        ImGui::Spacing();
-        if (tcGUICore::dash::button(tcGUICore::tr("重试连接", "Retry link"), ImVec2(-1.0f, 36.0f), false) &&
-            !busy) {
-            gLastPlcTry = -1.0;
-            tryConnectMaster();
-        }
-    }
+            : tcGUICore::tr("未连接也可登录；进入后功能栏锁定，并持续尝试连接 Control Core。",
+                "You can sign in now. The workspace stays locked until Control Core links."));
     ImGui::Spacing();
 
-    // 等 Control Core 时可先填账号；仅登录键受门控。
     tcGUICore::dash::caption(tcGUICore::tr("用户", "User"));
     ImGui::SetNextItemWidth(-1.0f);
     tcGUICore::dash::textField("##user", gLogin.user, sizeof(gLogin.user));
+    if (ImGui::IsItemActivated()) {
+        gOsk = OskTarget::User;
+        gOskShift = false;
+        gOskDigits = false;
+    }
     tcGUICore::dash::caption(tcGUICore::tr("密码", "Password"));
     ImGui::SetNextItemWidth(-1.0f);
     const bool enter = tcGUICore::dash::textField("##pass", gLogin.password, sizeof(gLogin.password),
         ImGuiInputTextFlags_Password | ImGuiInputTextFlags_EnterReturnsTrue);
+    if (ImGui::IsItemActivated()) {
+        gOsk = OskTarget::Password;
+        gOskShift = false;
+        gOskDigits = false;
+    }
     ImGui::Spacing();
 
-    auto submit = [&] {
-        if (!plcOn) {
-            return;
-        }
-        gLogin.failed = std::strcmp(gLogin.user, "admin") != 0 || std::strcmp(gLogin.password, "admin") != 0;
-        gAuthed = !gLogin.failed;
-        if (gAuthed) {
-            gPhase = Phase::Home;
-            gHomePage = HomePage::Instruments;
-        }
-    };
-
-    ImGui::BeginDisabled(!plcOn);
-    const bool clicked = tcGUICore::dash::button(tcGUICore::tr("登录", "Sign in"), ImVec2(-1.0f, 44.0f), true);
-    ImGui::EndDisabled();
-    if (plcOn && (clicked || enter)) {
-        submit();
-    }
-
+    const bool clicked = tcGUICore::dash::button(tcGUICore::tr("登录", "Sign in"), ImVec2(-1.0f, px(52.0f)), true);
     if (!plcOn) {
         ImGui::Spacing();
         tcGUICore::dash::progress(-1.0f);
@@ -441,6 +587,30 @@ void drawLogin()
     }
     tcGUICore::dash::hint(tcGUICore::tr("演示账号 admin / admin", "Demo account admin / admin"));
     tcGUICore::dash::endCard();
+    cardSize = ImGui::GetItemRectSize();
+
+    if (gOsk != OskTarget::None) {
+        lastOsk = gOsk;
+    }
+    if (gOskSlide > 0.002f) {
+        char* buf = lastOsk == OskTarget::User ? gLogin.user : gLogin.password;
+        const std::size_t cap = lastOsk == OskTarget::User ? sizeof(gLogin.user) : sizeof(gLogin.password);
+        drawOnscreenKeyboard(origin, avail, buf, cap, gOskSlide);
+    }
+
+    auto submit = [&] {
+        gLogin.failed = std::strcmp(gLogin.user, "admin") != 0 || std::strcmp(gLogin.password, "admin") != 0;
+        gAuthed = !gLogin.failed;
+        if (gAuthed) {
+            gOsk = OskTarget::None;
+            gPhase = Phase::Home;
+            gHomePage = HomePage::Instruments;
+        }
+    };
+
+    if (clicked || enter) {
+        submit();
+    }
 }
 
 float gVolume = 0.55f;
@@ -452,8 +622,8 @@ bool drawStatusRow(const char* toggleId, const char* label, bool on,
 {
     const float rowStartX = ImGui::GetCursorPosX();
     const float availW = ImGui::GetContentRegionAvail().x;
-    const float btnW = 72.0f;
-    const float btnH = 28.0f;
+    const float btnW = px(96.0f);
+    const float btnH = px(40.0f);
 
     tcGUICore::dash::led(on);
     ImGui::SameLine();
@@ -536,7 +706,7 @@ void drawToolCard(const char* id, const char* role, int bayIndex, ToolSlot& slot
             ImGui::PopFont();
             ImGui::PopStyleColor();
         } else {
-            tcGUICore::dash::title(type.c_str(), 30.0f);
+            tcGUICore::dash::title(type.c_str(), px(32.0f));
         }
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, textOnFill
@@ -600,14 +770,14 @@ void drawMsLockOverlay()
     ImGui::BeginChild("##ms_lock_layer", size, ImGuiChildFlags_None,
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
-    const ImVec2 panel(400.0f, 200.0f);
+    const ImVec2 panel(px(440.0f), px(220.0f));
     ImGui::SetCursorPos(ImVec2((size.x - panel.x) * 0.5f, (size.y - panel.y) * 0.5f));
     tcGUICore::dash::beginCard("##ms_lock_card", panel);
     tcGUICore::dash::caption(tcGUICore::tr("主从状态", "Master-Slave"));
-    tcGUICore::dash::title(tcGUICore::tr("屏幕已锁定", "Screen locked"), 26.0f);
+    tcGUICore::dash::title(tcGUICore::tr("屏幕已锁定", "Screen locked"), px(28.0f));
     tcGUICore::dash::hint(tcGUICore::tr("确认安全可解锁", "Confirm safe to unlock"));
     ImGui::Spacing();
-    if (tcGUICore::dash::button(tcGUICore::tr("解锁", "Unlock"), ImVec2(-1.0f, 44.0f), true)) {
+    if (tcGUICore::dash::button(tcGUICore::tr("解锁", "Unlock"), ImVec2(-1.0f, px(52.0f)), true)) {
         requestUserUnlock();
     }
     tcGUICore::dash::endCard();
@@ -699,109 +869,66 @@ void drawInstrumentsPage()
         2, gTools[2], cardSize, tcGUICore::dash::Accent::Cyan);
 
     ImGui::Dummy(ImVec2(0.0f, gap));
-    drawVolumeStrip(ImVec2(avail.x, std::max(64.0f, bottomH - gap)));
+    drawVolumeStrip(ImVec2(avail.x, std::max(px(72.0f), bottomH - gap)));
+}
+
+void drawBlankPage()
+{
+    const auto& pal = tcGUICore::dash::palette();
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddRectFilled(origin, origin + avail, pack(pal.window), 12.0f);
+    ImGui::Dummy(avail);
 }
 
 void drawPlcPage()
 {
-    tcGUICore::PlcClient* plc = clientOf(kMasterId);
-    const bool on = masterReady();
-    const bool busy = connecting(kMasterId);
-    tcGUICore::dash::beginCard("##plc_master", ImVec2(0.0f, 300.0f));
-    tcGUICore::dash::caption("MASTER");
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 36.0f);
-    tcGUICore::dash::led(on);
-    tcGUICore::dash::title("Control Core", 24.0f);
-    ImGui::Spacing();
-    tcGUICore::dash::caption("IP");
-    ImGui::SetNextItemWidth(-1.0f);
-    tcGUICore::dash::textField("##mip", gMasterEp.ip, sizeof(gMasterEp.ip));
-    tcGUICore::dash::caption(tcGUICore::tr("端口", "Port"));
-    ImGui::SetNextItemWidth(160.0f);
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, tcGUICore::dash::palette().field);
-    ImGui::PushStyleColor(ImGuiCol_Text, tcGUICore::dash::palette().text);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
-    ImGui::InputInt("##mport", &gMasterEp.port);
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(2);
-    if (gMasterEp.port < 1) {
-        gMasterEp.port = 851;
-    }
-    ImGui::Spacing();
-    tcGUICore::dash::progress(busy ? -1.0f : (on ? 1.0f : 0.0f));
-    ImGui::Spacing();
-    if (tcGUICore::dash::button(on ? tcGUICore::tr("断开", "Disconnect") : tcGUICore::tr("连接", "Connect"),
-            ImVec2(148.0f, 38.0f), !on) &&
-        !busy) {
-        if (on) {
-            plc->disconnect();
-        } else {
-            gLastPlcTry = -1.0;
-            tryConnectMaster();
-        }
-    }
-    ImGui::SameLine();
-    if (plc) {
-        tcGUICore::dash::hint(on ? plc->adsStateText().c_str() : plc->statusText().c_str());
-    }
-    tcGUICore::dash::endCard();
+    drawBlankPage();
 }
 
 void drawStatusPage()
 {
-    syncToolsFromPlc();
-    tcGUICore::PlcClient* plc = clientOf(kMasterId);
-    const bool on = masterReady();
-    for (ToolSlot& slot : gTools) {
-        enforceToolRules(slot);
-    }
-    tcGUICore::dash::beginCard("##status", ImVec2(0.0f, 260.0f));
-    tcGUICore::dash::caption(tcGUICore::tr("系统状态", "System status"));
-    tcGUICore::dash::title(on ? tcGUICore::tr("Control Core 在线", "Control Core online")
-                              : tcGUICore::tr("Control Core 离线", "Control Core offline"), 26.0f);
-    tcGUICore::dash::progress(on ? 1.0f : 0.0f);
-    ImGui::Spacing();
-    tcGUICore::dash::hint(plc ? plc->statusText().c_str() : "—");
-    ImGui::Spacing();
-    tcGUICore::dash::chip(tcGUICore::tr("左·夹钳", "L·Clamp"), gTools[0].toolPresent, tcGUICore::dash::Accent::Blue);
-    ImGui::SameLine();
-    tcGUICore::dash::chip(tcGUICore::tr("中·内镜", "C·Scope"), gTools[1].toolPresent, tcGUICore::dash::Accent::Violet);
-    ImGui::SameLine();
-    tcGUICore::dash::chip(tcGUICore::tr("右·电刀", "R·Energy"), gTools[2].toolPresent, tcGUICore::dash::Accent::Cyan);
-    ImGui::Spacing();
-    tcGUICore::dash::chip(tcGUICore::tr("左隔离板", "L isolator"), gTools[0].isolatorPresent, tcGUICore::dash::Accent::Green);
-    ImGui::SameLine();
-    tcGUICore::dash::chip(tcGUICore::tr("镜隔离板", "Scope isolator"), gTools[1].isolatorPresent, tcGUICore::dash::Accent::Green);
-    ImGui::SameLine();
-    tcGUICore::dash::chip(tcGUICore::tr("右隔离板", "R isolator"), gTools[2].isolatorPresent, tcGUICore::dash::Accent::Green);
-    tcGUICore::dash::endCard();
+    drawBlankPage();
 }
 
 void drawRail()
 {
+    const float icon = px(44.0f);
+    const float railW = icon + px(32.0f);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.075f, 0.085f, 1.0f));
-    ImGui::BeginChild("##rail", ImVec2(76.0f, 0.0f));
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::SetCursorPosX(16.0f);
+    ImGui::BeginChild("##rail", ImVec2(railW, 0.0f));
+    ImGui::Dummy(ImVec2(0.0f, px(10.0f)));
+    const float x = (railW - icon) * 0.5f;
+    ImGui::SetCursorPosX(x);
     if (tcGUICore::dash::iconButton("##nav_tools", tcGUICore::dash::iconTiles, gHomePage == HomePage::Instruments)) {
         gHomePage = HomePage::Instruments;
     }
-    ImGui::SetCursorPosX(16.0f);
+    ImGui::SetCursorPosX(x);
     if (tcGUICore::dash::iconButton("##nav_plc", tcGUICore::dash::iconPlug, gHomePage == HomePage::Plc)) {
         gHomePage = HomePage::Plc;
     }
-    ImGui::SetCursorPosX(16.0f);
+    ImGui::SetCursorPosX(x);
     if (tcGUICore::dash::iconButton("##nav_st", tcGUICore::dash::iconPulse, gHomePage == HomePage::Status)) {
         gHomePage = HomePage::Status;
     }
-    ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 64.0f);
-    ImGui::SetCursorPosX(16.0f);
+    const float gap = px(10.0f);
+    const float yQuit = ImGui::GetWindowHeight() - px(16.0f) - icon;
+    const float yLogout = yQuit - gap - icon;
+    ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY() + px(8.0f), yLogout));
+    ImGui::SetCursorPosX(x);
     if (tcGUICore::dash::iconButton("##logout", tcGUICore::dash::iconPower, false)) {
         gAuthed = false;
         gPhase = Phase::Login;
         gLogin.password[0] = '\0';
         gLogin.failed = false;
+        gOsk = OskTarget::None;
+    }
+    ImGui::SetCursorPosY(yQuit);
+    ImGui::SetCursorPosX(x);
+    if (tcGUICore::dash::iconButton("##quit", tcGUICore::dash::iconExit, false)) {
+        if (tcGUICore::Application* app = tcGUICore::Application::instance()) {
+            app->quit();
+        }
     }
     ImGui::EndChild();
     ImGui::PopStyleColor();
@@ -810,12 +937,12 @@ void drawRail()
 void drawHeader()
 {
     const bool plcOn = masterReady();
-    const float rowH = 32.0f;
+    const float rowH = px(36.0f);
 
     // 左：主标题
     ImGui::BeginGroup();
     ImGui::AlignTextToFramePadding();
-    tcGUICore::dash::title("Main Page", 22.0f);
+    tcGUICore::dash::title("Main Page", px(24.0f));
     const char* sub = tcGUICore::tr("器械舱", "Instrument bay");
     if (gHomePage == HomePage::Plc) {
         sub = tcGUICore::tr("Control Core 连接", "Control Core link");
@@ -828,10 +955,13 @@ void drawHeader()
     // 右：灯 / Control Core / 语言 —— 同一行垂直居中对齐
     const char* ctrl = "Control Core";
     const char* langLabel = tcGUICore::currentLanguage() == tcGUICore::Language::Zh ? "中文" : "EN";
-    const float langW = 72.0f;
-    const float rightW = 14.0f + 8.0f + ImGui::CalcTextSize(ctrl).x + 16.0f + langW;
+    const float langW = px(88.0f);
+    const float ledW = px(20.0f);
+    const float gap = px(12.0f);
+    const float inset = px(28.0f);
+    const float rightW = ledW + gap + ImGui::CalcTextSize(ctrl).x + gap + langW;
     ImGui::SameLine();
-    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX() + 16.0f, ImGui::GetWindowWidth() - rightW - 8.0f));
+    ImGui::SetCursorPosX(std::max(px(8.0f), ImGui::GetWindowWidth() - rightW - inset));
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);
 
     ImGui::BeginGroup();
@@ -856,15 +986,11 @@ void drawHeader()
 
 void drawHome()
 {
-    if (!masterReady()) {
-        // 会话中 Control Core 掉线：退回登录并禁止操作。
-        gAuthed = false;
-        gPhase = Phase::Login;
-        gLogin.failed = false;
-        return;
-    }
     pollMasterLink();
-    syncToolsFromPlc();
+    const bool opsEnabled = masterReady();
+    if (opsEnabled) {
+        syncToolsFromPlc();
+    }
     const float footer = ImGui::GetFrameHeightWithSpacing();
     ImVec2 body = ImGui::GetContentRegionAvail();
     body.y -= footer;
@@ -874,6 +1000,7 @@ void drawHome()
     ImGui::BeginChild("##pages", ImVec2(0.0f, 0.0f));
     drawHeader();
     ImGui::Spacing();
+    ImGui::BeginDisabled(!opsEnabled);
     switch (gHomePage) {
     case HomePage::Instruments:
         drawInstrumentsPage();
@@ -885,8 +1012,11 @@ void drawHome()
         drawStatusPage();
         break;
     }
+    ImGui::EndDisabled();
     ImGui::EndChild();
-    drawMsLockOverlay();
+    if (opsEnabled) {
+        drawMsLockOverlay();
+    }
     ImGui::EndChild();
 }
 

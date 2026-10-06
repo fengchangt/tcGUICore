@@ -37,6 +37,9 @@ public:
 
     int run();
 
+    // 关闭窗口并退出进程，回到桌面。
+    void quit();
+
 private:
     static Application* instance_;
     std::string title_;

@@ -5,6 +5,7 @@
 
 #include "imgui.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -13,6 +14,7 @@ namespace tcGUICore {
 
 namespace {
 ImFont* gTitleFont = nullptr;
+float gUiScale = 1.0f;
 }
 
 ImFont* titleFont()
@@ -45,6 +47,7 @@ void applyIndustrialDarkTheme()
     s.Alpha = 1.0f;
     s.DisabledAlpha = 0.50f;
     s.FontSizeBase = 18.0f;
+    s.TouchExtraPadding = ImVec2(0.0f, 0.0f);
 
     ImVec4* c = s.Colors;
     c[ImGuiCol_Text] = ImVec4(0.93f, 0.95f, 0.96f, 0.60f);
@@ -77,15 +80,27 @@ void applyIndustrialDarkTheme()
     c[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
 }
 
+void setUiScale(float scale)
+{
+    gUiScale = std::clamp(scale, 1.0f, 2.2f);
+}
+
+float uiScale()
+{
+    return gUiScale;
+}
+
 void loadDefaultFonts()
 {
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
+    const float px = 18.0f * gUiScale;
 
     struct Candidate {
         const char* path;
         int fontNo;
     };
+    // 优先无衬线黑体（贴近 Windows 微软雅黑）。树莓派常只有 Droid / 文泉驿，不要落到 uming 宋体。
     const Candidate fonts[] = {
         {"C:/Windows/Fonts/msyh.ttc", 0},
         {"C:/Windows/Fonts/msyh.ttf", 0},
@@ -98,7 +113,10 @@ void loadDefaultFonts()
         {"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 0},
         {"/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", 0},
         {"/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0},
+        {"/usr/share/fonts/truetype/wqy/wqy-microhei.ttf", 0},
         {"/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0},
+        {"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0},
+        {"/usr/share/fonts/truetype/droid/DroidSansFallback.ttf", 0},
         {"/usr/share/fonts/truetype/arphic/uming.ttc", 0},
         {"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0},
         {"/usr/share/fonts/truetype/freefont/FreeSans.ttf", 0},
@@ -117,7 +135,7 @@ void loadDefaultFonts()
         cfg.OversampleV = 1;
         cfg.PixelSnapH = true;
         cfg.FontNo = f.fontNo;
-        loaded = io.Fonts->AddFontFromFileTTF(f.path, 18.0f, &cfg);
+        loaded = io.Fonts->AddFontFromFileTTF(f.path, px, &cfg);
         if (loaded) {
             used = f.path;
             break;
@@ -152,7 +170,7 @@ void loadDefaultFonts()
         cfg.OversampleV = 1;
         cfg.PixelSnapH = true;
         cfg.FontNo = f.fontNo;
-        gTitleFont = io.Fonts->AddFontFromFileTTF(f.path, 16.0f, &cfg);
+        gTitleFont = io.Fonts->AddFontFromFileTTF(f.path, 16.0f * gUiScale, &cfg);
         if (gTitleFont) {
             logInfo(std::string(u8"已加载标题粗体 ") + f.path);
             break;
