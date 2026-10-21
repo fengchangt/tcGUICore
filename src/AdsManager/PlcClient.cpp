@@ -13,6 +13,14 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#else
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 #include "AdsDef.h"
@@ -65,8 +73,9 @@ std::string localIpv4List()
     closesocket(probe);
     return out;
 }
+#endif
 
-// AdsLib 的 TCP 连接没有超时，目标不可达时会卡住约 20 秒，并且只打印 “connect failed”。
+// AdsLib 的 TCP 连接没有超时，目标不可达时会卡住约 20 秒。先做短超时探测。
 bool adsTcpReachable(const std::string& ip, int timeoutMs, std::string& error)
 {
     sockaddr_in dest{};
@@ -76,19 +85,18 @@ bool adsTcpReachable(const std::string& ip, int timeoutMs, std::string& error)
         return true;
     }
 
+#ifdef _WIN32
     WSADATA data{};
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
         error = tr("Winsock 初始化失败", "Winsock init failed");
         return false;
     }
-
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) {
         error = tr("无法创建套接字", "Unable to create socket");
         WSACleanup();
         return false;
     }
-
     u_long nonBlock = 1;
     ioctlsocket(s, FIONBIO, &nonBlock);
     const int started = connect(s, reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
@@ -116,7 +124,6 @@ bool adsTcpReachable(const std::string& ip, int timeoutMs, std::string& error)
     if (soError == 0) {
         return true;
     }
-
     const std::string where = ip + ":48898";
     if (soError == WSAETIMEDOUT || soError == WSAEHOSTUNREACH || soError == WSAENETUNREACH) {
         error = tr("连不上 ", "Cannot reach ") + where +
@@ -131,8 +138,54 @@ bool adsTcpReachable(const std::string& ip, int timeoutMs, std::string& error)
         error = tr("连接 ", "Connect ") + where + tr(" 失败，错误码 ", " failed, error ") + std::to_string(soError);
     }
     return false;
+#else
+    const int s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s < 0) {
+        error = tr("无法创建套接字", "Unable to create socket");
+        return false;
+    }
+    const int flags = fcntl(s, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    }
+    const int started = ::connect(s, reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
+    int soError = 0;
+    if (started != 0 && errno != EINPROGRESS) {
+        soError = errno;
+    } else if (started != 0) {
+        fd_set writeSet;
+        FD_ZERO(&writeSet);
+        FD_SET(s, &writeSet);
+        timeval wait{};
+        wait.tv_sec = timeoutMs / 1000;
+        wait.tv_usec = (timeoutMs % 1000) * 1000;
+        const int selected = ::select(s + 1, nullptr, &writeSet, nullptr, &wait);
+        if (selected <= 0) {
+            soError = ETIMEDOUT;
+        } else {
+            socklen_t length = sizeof(soError);
+            getsockopt(s, SOL_SOCKET, SO_ERROR, &soError, &length);
+        }
+    }
+    ::close(s);
+    if (soError == 0) {
+        return true;
+    }
+    const std::string where = ip + ":48898";
+    if (soError == ETIMEDOUT || soError == EHOSTUNREACH || soError == ENETUNREACH) {
+        error = tr("Control Core 未在线（", "Control Core offline (") + where +
+            tr("），将自动重试", "), will retry");
+    } else if (soError == ECONNREFUSED) {
+        error = tr("Control Core 拒绝连接（", "Control Core refused (") + where +
+            tr("），将自动重试", "), will retry");
+    } else {
+        error = tr("连接 ", "Connect ") + where + tr(" 失败，将自动重试", " failed, will retry");
+    }
+    return false;
+#endif
 }
 
+#ifdef _WIN32
 #pragma pack(push, 1)
 struct TcAmsNetId {
     unsigned char b[6];
@@ -434,24 +487,51 @@ void PlcClient::connectWorker()
         return;
     }
 
+    // 离线时快速失败，避免 AdsDevice 卡死导致永远停在 Connecting、无法重试。
+    std::string reachError;
+    const int probeMs = cfg.timeoutMs > 0 && cfg.timeoutMs < 3000 ? static_cast<int>(cfg.timeoutMs) : 2500;
+    if (!adsTcpReachable(cfg.ip, probeMs, reachError)) {
+        if (cancel_) {
+            state_ = ConnectionState::Disconnected;
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastError_ = reachError;
+        adsStateText_ = "—";
+        device_.reset();
+        state_ = ConnectionState::Error;
+        logWarn(std::string(tr("连接失败: ", "Connect failed: ")) + lastError_);
+        return;
+    }
+
+    // 必须拿到真实 AMS NetId；不要用 IP.1.1 猜测（Control Core 的 NetId 常与 IP 不同）。
     std::string remoteNetId;
     std::string resolveError;
-    if (resolveRemoteAmsNetId(cfg.ip, remoteNetId, resolveError)) {
-        if (cfg.amsNetId != remoteNetId) {
-            logInfo(std::string("AdsLib GetRemoteAddress ") + cfg.ip + " -> " + remoteNetId +
-                (cfg.amsNetId.empty() ? std::string() : (std::string(" (") +
-                    tr("配置曾为 ", "config was ") + cfg.amsNetId + ")")));
+    if (!resolveRemoteAmsNetId(cfg.ip, remoteNetId, resolveError)) {
+        if (cancel_) {
+            state_ = ConnectionState::Disconnected;
+            return;
         }
-        cfg.amsNetId = remoteNetId;
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastError_ = resolveError.empty()
+            ? tr("Control Core 未就绪，将自动重试", "Control Core not ready, will retry")
+            : resolveError;
+        adsStateText_ = "—";
+        device_.reset();
+        state_ = ConnectionState::Error;
+        logWarn(std::string(tr("连接失败: ", "Connect failed: ")) + lastError_);
+        return;
+    }
+    if (cfg.amsNetId != remoteNetId) {
+        logInfo(std::string("AdsLib GetRemoteAddress ") + cfg.ip + " -> " + remoteNetId +
+            (cfg.amsNetId.empty() ? std::string() : (std::string(" (") +
+                tr("配置曾为 ", "config was ") + cfg.amsNetId + ")")));
+    }
+    cfg.amsNetId = remoteNetId;
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         config_.amsNetId = remoteNetId;
         config_.configAmsNetId = remoteNetId;
-    } else {
-        logWarn(resolveError + tr("，回退配置 NetId ", ", falling back to config NetId ") +
-            (cfg.amsNetId.empty() ? amsNetIdFromIp(cfg.ip) : cfg.amsNetId));
-        if (cfg.amsNetId.empty()) {
-            cfg.amsNetId = amsNetIdFromIp(cfg.ip);
-        }
     }
 
     const AmsNetId netId = make_AmsNetId(cfg.amsNetId);
@@ -515,21 +595,11 @@ void PlcClient::connectWorker()
                 }
             }
         }
-        std::string reachError;
-        const int probeMs = cfg.timeoutMs > 0 && cfg.timeoutMs < 3000 ? static_cast<int>(cfg.timeoutMs) : 2500;
-        if (!adsTcpReachable(cfg.ip, probeMs, reachError)) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            lastError_ = reachError;
-            adsStateText_ = "—";
-            device_.reset();
-            state_ = ConnectionState::Error;
-            logError(std::string(tr("连接失败: ", "Connect failed: ")) + lastError_);
-            return;
-        }
 #endif
         auto holder = std::make_unique<DeviceHolder>();
         holder->device = std::make_unique<AdsDevice>(cfg.ip, netId, cfg.adsPort);
         if (cancel_) {
+            state_ = ConnectionState::Disconnected;
             return;
         }
         holder->device->SetTimeout(cfg.timeoutMs);

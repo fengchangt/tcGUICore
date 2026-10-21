@@ -1,5 +1,10 @@
 #include "Platform.h"
 
+#include "Log.h"
+
+#include <cstdlib>
+#include <fstream>
+#include <string>
 #include <vector>
 
 #if defined(_WIN32)
@@ -8,6 +13,7 @@
 #endif
 #include <windows.h>
 #else
+#include <sys/wait.h>
 #include <unistd.h>
 #include <limits.h>
 #endif
@@ -88,6 +94,86 @@ std::string chineseFontPath()
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
     });
+}
+
+#if defined(__linux__)
+bool touchscreenPresent()
+{
+    // Healthy path after re-enum: absolute mouse named TSTP MTouch (0416:c169).
+    std::error_code ec;
+    if (std::filesystem::exists("/dev/input/by-id/usb-TSTP_MTouch_CMTP_1.0-event-mouse", ec)) {
+        return true;
+    }
+    std::ifstream devices("/proc/bus/input/devices");
+    if (!devices) {
+        return false;
+    }
+    std::string line;
+    std::string name;
+    while (std::getline(devices, line)) {
+        if (line.rfind("N: Name=", 0) == 0) {
+            name = line.substr(8);
+            continue;
+        }
+        if (line.rfind("B: ABS=", 0) == 0 && name.find("MTouch") != std::string::npos
+            && line != "B: ABS=0") {
+            return true;
+        }
+        if (line.empty()) {
+            name.clear();
+        }
+    }
+    return false;
+}
+
+int runTouchEnsureScript(const std::string& script)
+{
+    // Prefer passwordless sudo so authorized/usbreset work; fall back to plain exec.
+    const std::string cmd = "sudo -n " + script + " >/dev/null 2>&1 || " + script + " >/dev/null 2>&1";
+    const int rc = std::system(cmd.c_str());
+    if (rc < 0) {
+        return -1;
+    }
+#if defined(WIFEXITED) && defined(WEXITSTATUS)
+    if (WIFEXITED(rc)) {
+        return WEXITSTATUS(rc);
+    }
+#endif
+    return rc;
+}
+#endif
+
+void ensureTouchscreen()
+{
+#if !defined(__linux__)
+    return;
+#else
+    if (touchscreenPresent()) {
+        logInfo("触摸屏已就绪 (TSTP MTouch)");
+        return;
+    }
+    logWarn("未检测到触摸屏输入，尝试刷新 USB 驱动…");
+
+    const std::string exeDir = executableDir();
+    const std::string script = firstExistingFile({
+        exeDir + "/ensure_touchscreen.sh",
+        exeDir + "/../../scripts/ensure_touchscreen.sh",
+        "/usr/local/sbin/surgeon-console-ensure-touch.sh",
+        "/home/curvepi/github/tcGUICore/scripts/ensure_touchscreen.sh",
+    });
+    if (script.empty()) {
+        logError("找不到 ensure_touchscreen.sh，无法自动刷新触摸驱动");
+        return;
+    }
+
+    const int rc = runTouchEnsureScript(script);
+    if (touchscreenPresent()) {
+        logInfo(std::string("触摸屏已恢复 (") + script + ")");
+        return;
+    }
+    logWarn(std::string("触摸屏刷新后仍不可用 (exit=") + std::to_string(rc)
+        + ")，请检查 USB 线或重新插拔");
+#endif
 }
 
 } // namespace tcGUICore::platform

@@ -307,7 +307,50 @@ void requestEwmhFullscreen(GLFWwindow* window)
         SubstructureRedirectMask | SubstructureNotifyMask, &ev);
     XFlush(dpy);
 }
+
+void coverMonitorX11(GLFWwindow* window, int x, int y, int w, int h)
+{
+    Display* dpy = glfwGetX11Display();
+    const Window xid = glfwGetX11Window(window);
+    if (!dpy || !xid || w < 1 || h < 1) {
+        return;
+    }
+    XMoveResizeWindow(dpy, xid, x, y, static_cast<unsigned>(w), static_cast<unsigned>(h));
+    XMapRaised(dpy, xid);
+    XRaiseWindow(dpy, xid);
+    XFlush(dpy);
+}
 #endif
+
+bool envFlag(const char* name)
+{
+    const char* value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return false;
+    }
+    const char c = value[0];
+    return c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T';
+}
+
+bool kioskRequested(const WindowConfig& window)
+{
+    return window.fullscreen || envFlag("TCGUICORE_FULLSCREEN") || envFlag("TCGUICORE_MAXIMIZE");
+}
+
+bool monitorGeometry(GLFWmonitor* monitor, int& x, int& y, int& w, int& h)
+{
+    if (!monitor) {
+        return false;
+    }
+    const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+    if (!mode || mode->width < 1 || mode->height < 1) {
+        return false;
+    }
+    glfwGetMonitorPos(monitor, &x, &y);
+    w = mode->width;
+    h = mode->height;
+    return true;
+}
 
 void applyKioskFullscreen(GLFWwindow* window)
 {
@@ -320,25 +363,31 @@ void applyKioskFullscreen(GLFWwindow* window)
     glfwSetWindowAttrib(window, GLFW_FLOATING, GLFW_TRUE);
     glfwSetWindowAttrib(window, GLFW_AUTO_ICONIFY, GLFW_FALSE);
 
-    GLFWmonitor* monitor = glfwGetWindowMonitor(window);
-    if (!monitor) {
-        monitor = glfwGetPrimaryMonitor();
-    }
-    if (!monitor) {
-        glfwMaximizeWindow(window);
-        return;
-    }
-    const GLFWvidmode* mode = glfwGetVideoMode(monitor);
-    if (!mode) {
-        glfwMaximizeWindow(window);
-        return;
-    }
+    GLFWmonitor* monitor = glfwGetPrimaryMonitor();
     int mx = 0;
     int my = 0;
-    glfwGetMonitorPos(monitor, &mx, &my);
-    glfwSetWindowMonitor(window, monitor, mx, my, mode->width, mode->height, mode->refreshRate);
-#if defined(__linux__)
+    int mw = 0;
+    int mh = 0;
+    if (!monitorGeometry(monitor, mx, my, mw, mh)) {
+        glfwMaximizeWindow(window);
+        return;
+    }
+#ifdef _WIN32
+    glfwSetWindowMonitor(window, monitor, mx, my, mw, mh, glfwGetVideoMode(monitor)->refreshRate);
+#elif defined(__linux__)
+    // labwc + Xwayland: exclusive glfwSetWindowMonitor often no-ops or leaves a
+    // 1600x900 window while GLFW still reports a monitor — use borderless cover.
+    if (glfwGetWindowMonitor(window) != nullptr) {
+        glfwSetWindowMonitor(window, nullptr, mx, my, mw, mh, 0);
+    } else {
+        glfwSetWindowPos(window, mx, my);
+        glfwSetWindowSize(window, mw, mh);
+    }
+    hideNativeDecorations(window);
     requestEwmhFullscreen(window);
+    coverMonitorX11(window, mx, my, mw, mh);
+#else
+    glfwSetWindowMonitor(window, monitor, mx, my, mw, mh, glfwGetVideoMode(monitor)->refreshRate);
 #endif
 }
 
@@ -348,17 +397,27 @@ void maintainKioskFullscreen(GLFWwindow* window)
         return;
     }
     static int ticks = 0;
-    if (ticks > 120) {
-        return;
-    }
     ++ticks;
-    if (glfwGetWindowMonitor(window) == nullptr) {
-        applyKioskFullscreen(window);
+
+    int mx = 0;
+    int my = 0;
+    int mw = 0;
+    int mh = 0;
+    if (!monitorGeometry(glfwGetPrimaryMonitor(), mx, my, mw, mh)) {
         return;
     }
-#if defined(__linux__)
-    requestEwmhFullscreen(window);
-#endif
+    int wx = 0;
+    int wy = 0;
+    int ww = 0;
+    int wh = 0;
+    glfwGetWindowPos(window, &wx, &wy);
+    glfwGetWindowSize(window, &ww, &wh);
+    const bool drifted = std::abs(wx - mx) > 2 || std::abs(wy - my) > 2
+        || std::abs(ww - mw) > 2 || std::abs(wh - mh) > 2;
+    // 启动后前几秒持续校正；之后若被 WM 改小则立即再铺满。
+    if (drifted || ticks <= 300 || (ticks % 120) == 0) {
+        applyKioskFullscreen(window);
+    }
 }
 
 #ifdef _WIN32
@@ -2492,6 +2551,9 @@ ShellWindow::ShellWindow(std::string title, AdsHub& hub, FrameCallback onFrame, 
 
 int ShellWindow::run()
 {
+    // USB 触摸屏（TSTP MTouch）开机有时未枚举成功；GLFW 启动前先检测并刷新。
+    platform::ensureTouchscreen();
+
     glfwSetErrorCallback([](int error, const char* desc) {
         std::fprintf(stderr, "GLFW %d: %s\n", error, desc);
     });
@@ -2500,12 +2562,25 @@ int ShellWindow::run()
     }
 
     const char* glslVersion = "#version 330";
+    const bool kiosk = kioskRequested(window_);
+    int createW = window_.width;
+    int createH = window_.height;
+    if (kiosk) {
+        int mx = 0;
+        int my = 0;
+        int mw = 0;
+        int mh = 0;
+        if (monitorGeometry(glfwGetPrimaryMonitor(), mx, my, mw, mh)) {
+            createW = mw;
+            createH = mh;
+        }
+    }
 #ifdef _WIN32
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
     glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE);
-    GLFWwindow* window = glfwCreateWindow(window_.width, window_.height, title_.c_str(), nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(createW, createH, title_.c_str(), nullptr, nullptr);
 #else
     // Ubuntu 虚拟机一般有 OpenGL 3.3。树莓派桌面多为 3.1 / ES3，逐级降级。
     GLFWwindow* window = nullptr;
@@ -2537,7 +2612,7 @@ int ShellWindow::run()
             glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
             glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
             glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE);
-            window = glfwCreateWindow(window_.width, window_.height, title_.c_str(), nullptr, nullptr);
+            window = glfwCreateWindow(createW, createH, title_.c_str(), nullptr, nullptr);
             if (window) {
                 glslVersion = attempt.glsl;
                 break;
@@ -2569,15 +2644,7 @@ int ShellWindow::run()
     hideNativeDecorations(window);
 #endif
     updateWindowCorners(window);
-    auto envFlag = [](const char* name) {
-        const char* value = std::getenv(name);
-        if (!value || value[0] == '\0') {
-            return false;
-        }
-        const char c = value[0];
-        return c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T';
-    };
-    if (window_.fullscreen || envFlag("TCGUICORE_FULLSCREEN") || envFlag("TCGUICORE_MAXIMIZE")) {
+    if (kiosk) {
         applyKioskFullscreen(window);
     } else if (window_.maximize) {
         glfwMaximizeWindow(window);
@@ -2588,7 +2655,8 @@ int ShellWindow::run()
     ImPlot::CreateContext();
     ImPlot3D::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    // 触摸屏 kiosk：关闭键盘导航，避免 HDMI-CEC / 误报 HID 键激活控件。
+    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = nullptr;
 
     applyIndustrialDarkTheme();
@@ -2596,11 +2664,12 @@ int ShellWindow::run()
         int fbW = 0;
         int fbH = 0;
         glfwGetFramebufferSize(window, &fbW, &fbH);
-        // 7" 1920x1080 触摸屏：按高度放大控件，保证按键约 8mm。
-        setUiScale(std::clamp(static_cast<float>(fbH > 0 ? fbH : window_.height) / 620.0f, 1.0f, 2.0f));
+        // 7" 1920x1080 触摸屏：略提高基准字号与缩放，保证标签可读、按键够大。
+        setUiScale(std::clamp(static_cast<float>(fbH > 0 ? fbH : window_.height) / 540.0f, 1.0f, 2.2f));
         ImGui::GetStyle().ScaleAllSizes(uiScale());
-        ImGui::GetStyle().TouchExtraPadding = ImVec2(8.0f, 8.0f);
-        ImGui::GetStyle().FontSizeBase = 18.0f * uiScale();
+        // 过大的 TouchExtraPadding 会让登录框与键盘命中区重叠，造成幻触乱输入。
+        ImGui::GetStyle().TouchExtraPadding = ImVec2(4.0f, 4.0f);
+        ImGui::GetStyle().FontSizeBase = 22.0f * uiScale();
     }
     loadDefaultFonts();
     ImPlot::StyleColorsDark();

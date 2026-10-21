@@ -46,7 +46,7 @@ void applyIndustrialDarkTheme()
     s.ScrollbarSize = 14.0f;
     s.Alpha = 1.0f;
     s.DisabledAlpha = 0.50f;
-    s.FontSizeBase = 18.0f;
+    s.FontSizeBase = 22.0f;
     s.TouchExtraPadding = ImVec2(0.0f, 0.0f);
 
     ImVec4* c = s.Colors;

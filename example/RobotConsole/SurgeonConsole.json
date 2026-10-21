@@ -33,6 +33,27 @@
           "label": { "zh": "左隔离板", "en": "Left isolator" }
         },
         {
+          "name": "toolType0",
+          "symbol": "GVL_Surgeon.arrToolBay[0].eToolType",
+          "type": "uint16",
+          "direction": "input",
+          "label": { "zh": "左器械类型", "en": "Left tool type" }
+        },
+        {
+          "name": "toolLife0",
+          "symbol": "GVL_Surgeon.arrToolBay[0].nToolLife",
+          "type": "uint32",
+          "direction": "input",
+          "label": { "zh": "左器械寿命", "en": "Left tool life" }
+        },
+        {
+          "name": "toolVersion0",
+          "symbol": "GVL_Surgeon.arrToolBay[0].nToolVersion",
+          "type": "uint32",
+          "direction": "input",
+          "label": { "zh": "左器械版本", "en": "Left tool version" }
+        },
+        {
           "name": "tool1",
           "symbol": "GVL_Surgeon.arrToolBay[1].bToolPresent",
           "type": "bool",
@@ -47,6 +68,27 @@
           "label": { "zh": "内镜隔离板", "en": "Scope isolator" }
         },
         {
+          "name": "toolType1",
+          "symbol": "GVL_Surgeon.arrToolBay[1].eToolType",
+          "type": "uint16",
+          "direction": "input",
+          "label": { "zh": "内镜类型", "en": "Scope tool type" }
+        },
+        {
+          "name": "toolLife1",
+          "symbol": "GVL_Surgeon.arrToolBay[1].nToolLife",
+          "type": "uint32",
+          "direction": "input",
+          "label": { "zh": "内镜寿命", "en": "Scope tool life" }
+        },
+        {
+          "name": "toolVersion1",
+          "symbol": "GVL_Surgeon.arrToolBay[1].nToolVersion",
+          "type": "uint32",
+          "direction": "input",
+          "label": { "zh": "内镜版本", "en": "Scope tool version" }
+        },
+        {
           "name": "tool2",
           "symbol": "GVL_Surgeon.arrToolBay[2].bToolPresent",
           "type": "bool",
@@ -59,6 +101,27 @@
           "type": "bool",
           "direction": "output",
           "label": { "zh": "右隔离板", "en": "Right isolator" }
+        },
+        {
+          "name": "toolType2",
+          "symbol": "GVL_Surgeon.arrToolBay[2].eToolType",
+          "type": "uint16",
+          "direction": "input",
+          "label": { "zh": "右器械类型", "en": "Right tool type" }
+        },
+        {
+          "name": "toolLife2",
+          "symbol": "GVL_Surgeon.arrToolBay[2].nToolLife",
+          "type": "uint32",
+          "direction": "input",
+          "label": { "zh": "右器械寿命", "en": "Right tool life" }
+        },
+        {
+          "name": "toolVersion2",
+          "symbol": "GVL_Surgeon.arrToolBay[2].nToolVersion",
+          "type": "uint32",
+          "direction": "input",
+          "label": { "zh": "右器械版本", "en": "Right tool version" }
         },
         {
           "name": "msMode",

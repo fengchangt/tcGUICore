@@ -32,6 +32,35 @@ else
   USER_NAME="$(id -un)"
 fi
 
+# USB 触摸屏检测/刷新脚本（TSTP MTouch 0416:c168/c169）。
+TOUCH_SRC="$ROOT/scripts/ensure_touchscreen.sh"
+TOUCH_BIN="$DIR/ensure_touchscreen.sh"
+TOUCH_SBIN="/usr/local/sbin/surgeon-console-ensure-touch.sh"
+if [[ -f "$TOUCH_SRC" ]]; then
+  cp -f "$TOUCH_SRC" "$TOUCH_BIN"
+  chmod 755 "$TOUCH_BIN"
+  if [[ "$(id -un)" = "root" ]]; then
+    cp -f "$TOUCH_SRC" "$TOUCH_SBIN"
+    chmod 755 "$TOUCH_SBIN"
+  else
+    sudo -n cp -f "$TOUCH_SRC" "$TOUCH_SBIN" 2>/dev/null && sudo -n chmod 755 "$TOUCH_SBIN" 2>/dev/null || true
+  fi
+fi
+
+# 允许 curvepi 无密码执行触摸刷新（authorized / usbreset）。
+SUDOERS_FILE="/etc/sudoers.d/surgeon-console-touch"
+SUDOERS_BODY="${USER_NAME} ALL=(root) NOPASSWD: ${TOUCH_SBIN}, ${TOUCH_BIN}, /usr/bin/usbreset"
+if [[ "$(id -un)" = "root" ]]; then
+  printf '%s\n' "$SUDOERS_BODY" >"$SUDOERS_FILE"
+  chmod 440 "$SUDOERS_FILE"
+elif sudo -n true 2>/dev/null; then
+  printf '%s\n' "$SUDOERS_BODY" | sudo -n tee "$SUDOERS_FILE" >/dev/null
+  sudo -n chmod 440 "$SUDOERS_FILE"
+else
+  echo "提示: 无法写入 $SUDOERS_FILE（需要一次 sudo）。可手动执行:"
+  echo "  echo '$SUDOERS_BODY' | sudo tee $SUDOERS_FILE && sudo chmod 440 $SUDOERS_FILE"
+fi
+
 WRAPPER="$DIR/SurgeonConsole-autostart.sh"
 cat > "$WRAPPER" <<EOF
 #!/usr/bin/env bash
@@ -39,6 +68,8 @@ cat > "$WRAPPER" <<EOF
 set -u
 EXE=$(printf '%q' "$EXE")
 DIR=$(printf '%q' "$DIR")
+TOUCH_BIN=$(printf '%q' "$TOUCH_BIN")
+TOUCH_SBIN=$(printf '%q' "$TOUCH_SBIN")
 LOG_DIR="\${XDG_STATE_HOME:-\$HOME/.local/state}/surgeon-console"
 mkdir -p "\$LOG_DIR"
 LOG="\$LOG_DIR/autostart.log"
@@ -76,6 +107,18 @@ fi
 sleep 3
 if command -v xdpyinfo >/dev/null 2>&1; then
   xdpyinfo -display "\$DISPLAY" >/dev/null 2>&1 || true
+fi
+
+# USB 触摸屏：缺失或停在坏模式 (0416:c168) 时刷新。
+TOUCH=""
+if [[ -x "\$TOUCH_SBIN" ]]; then
+  TOUCH="\$TOUCH_SBIN"
+elif [[ -x "\$TOUCH_BIN" ]]; then
+  TOUCH="\$TOUCH_BIN"
+fi
+if [[ -n "\$TOUCH" ]]; then
+  echo "\$(date -Iseconds) ensure touchscreen via \$TOUCH" >>"\$LOG"
+  sudo -n "\$TOUCH" >>"\$LOG" 2>&1 || "\$TOUCH" >>"\$LOG" 2>&1 || true
 fi
 
 cd "\$DIR" || exit 1
@@ -132,13 +175,15 @@ if ! grep -Fq "SurgeonConsole-autostart.sh" "$LABWC_AUTO"; then
 fi
 chmod 755 "$LABWC_AUTO"
 if [[ "$(id -un)" = "root" && -n "$USER_NAME" ]]; then
-  chown "$USER_NAME":"$USER_NAME" "$LABWC_AUTO" "$DESKTOP" "$WRAPPER" 2>/dev/null || true
+  chown "$USER_NAME":"$USER_NAME" "$LABWC_AUTO" "$DESKTOP" "$WRAPPER" "$TOUCH_BIN" 2>/dev/null || true
   chown -R "$USER_NAME":"$USER_NAME" "$LABWC_DIR" "$AUTO" 2>/dev/null || true
 fi
 
 echo "已写入 XDG 自启: $DESKTOP"
 echo "已写入 labwc 自启: $LABWC_AUTO"
 echo "启动包装脚本: $WRAPPER"
+echo "触摸刷新脚本: $TOUCH_BIN (系统副本: $TOUCH_SBIN)"
 echo "日志: $USER_HOME/.local/state/surgeon-console/autostart.log"
+echo "触摸日志: $USER_HOME/.local/state/surgeon-console/touchscreen.log"
 echo "下次图形登录会等待桌面就绪后全屏启动 SurgeonConsole。"
 echo "取消自启: rm -f \"$DESKTOP\" 并从 $LABWC_AUTO 删除 SurgeonConsole 行"
