@@ -2770,7 +2770,12 @@ int ShellWindow::run()
     }
 #endif
     using frame_clock = std::chrono::steady_clock;
+    // 树莓派 + Xwayland 触控台：60Hz 足够，120Hz 易抢 CPU 造成卡顿。
+#if defined(__linux__)
+    constexpr auto kFrame = std::chrono::nanoseconds(1'000'000'000 / 60);
+#else
     constexpr auto kFrame = std::chrono::nanoseconds(1'000'000'000 / 120);
+#endif
     while (!glfwWindowShouldClose(window)) {
         const auto frameStart = frame_clock::now();
         glfwPollEvents();

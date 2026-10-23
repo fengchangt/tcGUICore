@@ -218,9 +218,64 @@ uint32_t readPlcU32(const char* name, uint32_t fallback)
     return value;
 }
 
+float readPlcFloat(const char* name, float fallback)
+{
+    tcGUICore::RuntimeVariable* var = plcVar(name);
+    if (!var || !var->ok || var->data.size() < sizeof(float)) {
+        return fallback;
+    }
+    float value = 0.0f;
+    std::memcpy(&value, var->data.data(), sizeof(value));
+    return value;
+}
+
+bool writePlcFloat(const char* name, float value)
+{
+    tcGUICore::RuntimeVariable* var = plcVar(name);
+    if (!var) {
+        return false;
+    }
+    return tcGUICore::Application::instance()->ads().writeFromUi(*var, &value, sizeof(value));
+}
+
 bool msScreenLocked()
 {
     return masterReady() && readMsMode() == kMsPaired;
+}
+
+double gLastToolSync = -1.0;
+float gVolume = 0.55f;
+bool gVolumeOpen = false;
+bool gVolumeSeeded = false;
+float gLastVolumeWrote = -1.0f;
+
+void syncVolumeFromPlc()
+{
+    if (!masterReady()) {
+        return;
+    }
+    // 仅首次从 PLC 拉取，避免拖动滑条时被周期读回覆盖。
+    if (!gVolumeSeeded) {
+        const float v = std::clamp(readPlcFloat("volume", gVolume), 0.0f, 1.0f);
+        gVolume = v;
+        gLastVolumeWrote = v;
+        gVolumeSeeded = true;
+    }
+}
+
+void applyVolumeToPlc(float value)
+{
+    value = std::clamp(value, 0.0f, 1.0f);
+    gVolume = value;
+    if (!masterReady()) {
+        return;
+    }
+    if (std::fabs(value - gLastVolumeWrote) < 0.005f) {
+        return;
+    }
+    if (writePlcFloat("volume", value)) {
+        gLastVolumeWrote = value;
+    }
 }
 
 void syncToolsFromPlc()
@@ -228,6 +283,13 @@ void syncToolsFromPlc()
     if (!masterReady()) {
         return;
     }
+    // 触摸屏主循环勿每帧狂刷 PLC，约 10Hz 足够刷新类型/寿命。
+    const double now = ImGui::GetTime();
+    if (gLastToolSync >= 0.0 && (now - gLastToolSync) < 0.1) {
+        return;
+    }
+    gLastToolSync = now;
+
     for (int i = 0; i < 3; ++i) {
         gTools[i].toolPresent = readPlcBool(kToolNames[i], gTools[i].toolPresent);
         gTools[i].isolatorPresent = readPlcBool(kIsoNames[i], gTools[i].isolatorPresent);
@@ -242,6 +304,7 @@ void syncToolsFromPlc()
         }
         enforceToolRules(gTools[i]);
     }
+    syncVolumeFromPlc();
 }
 
 void applyToolPresent(int index, bool present)
@@ -860,9 +923,6 @@ void drawLogin()
     }
 }
 
-float gVolume = 0.55f;
-bool gVolumeOpen = false;
-
 // 简约安装行：左侧状态字 + 右侧按键；点击且允许时返回 true。
 bool drawStatusRow(const char* toggleId, const char* label, bool on, bool actionEnabled)
 {
@@ -1091,7 +1151,10 @@ void drawVolumeStrip(const ImVec2& size)
     if (gVolumeOpen) {
         const float barW = std::max(px(160.0f), ImGui::GetContentRegionAvail().x - px(72.0f));
         ImGui::SetNextItemWidth(barW);
-        tcGUICore::dash::slider("##volume", &gVolume, 0.0f, 1.0f);
+        if (tcGUICore::dash::slider("##volume", &gVolume, 0.0f, 1.0f) ||
+            ImGui::IsItemDeactivatedAfterEdit()) {
+            applyVolumeToPlc(gVolume);
+        }
         ImGui::SameLine(0.0f, px(8.0f));
         ImGui::AlignTextToFramePadding();
         char level[32];

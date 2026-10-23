@@ -227,6 +227,18 @@ if [[ "$FORCE" -eq 0 ]] && touch_ok; then
   exit 0
 fi
 
+# 开机早期 USB 常尚未枚举完成；先被动等待，避免连续 xhci rebind 把总线打挂、拖垮整机。
+if [[ "$FORCE" -eq 0 ]] && ! vendor_ok; then
+  log "USB MTouch not visible yet; waiting for cold enum ($(status_line | tr '\n' ' '))"
+  for _ in $(seq 1 40); do
+    if touch_ok; then
+      log "touchscreen OK after cold wait ($(status_line | tr '\n' ' '))"
+      exit 0
+    fi
+    sleep 0.25
+  done
+fi
+
 log "touchscreen not ready ($(status_line | tr '\n' ' ')); attempting USB refresh"
 attempts=3
 [[ "$FORCE" -eq 1 ]] && attempts=2
